@@ -1,0 +1,278 @@
+#include "mbed.h"
+#include <math.h>
+
+/*
+ * =========================
+ *  STM32F401 + mbed2 示例
+ *  动作：0.5m -> 180°掉头 -> 0.5m
+ * =========================
+ *
+ * 说明：
+ * 1) 本代码使用 ISR 计数编码器（每轮1路脉冲输入）
+ * 2) 方向符号由当前电机指令决定
+ * 3) 若你是AB正交两路编码器，可后续换QEI/TIM编码器模式
+ */
+
+// ========= 电机控制引脚（按你前面提供的接线） =========
+DigitalOut M_EN_GLOBAL(PA_2);   // 总使能
+DigitalOut M_AUX      (PA_3);   // 额外控制脚（保持高）
+
+DigitalOut L_DIR(PA_8);
+PwmOut     L_PWM(PB_10);
+DigitalOut L_EN (PB_4);
+
+DigitalOut R_DIR(PB_5);
+PwmOut     R_PWM(PB_3);
+DigitalOut R_EN (PA_10);
+
+// ========= 编码器输入（每轮1路） =========
+InterruptIn ENC_L(PA_0);
+InterruptIn ENC_R(PA_1);
+
+// ========= 全局计数 =========
+volatile int32_t g_enc_l = 0;
+volatile int32_t g_enc_r = 0;
+
+// 方向符号：前进+1，后退-1（由电机指令更新）
+volatile int8_t g_sign_l = +1;
+volatile int8_t g_sign_r = +1;
+
+// ========= 工具函数 =========
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+static inline int32_t iabs32(int32_t x) { return (x >= 0) ? x : -x; }
+static inline int32_t round_i32(float x) {
+    return (int32_t)((x >= 0.0f) ? (x + 0.5f) : (x - 0.5f));
+}
+
+// ========= 机械/编码器参数（必须按实物校准） =========
+static const float PI_F = 3.1415926f;
+
+// 轮子直径（米）例如65mm
+static const float WHEEL_DIAMETER_M = 0.065f;
+
+// 轮距（两轮中心距离，米）例如155mm
+static const float TRACK_WIDTH_M    = 0.155f;
+
+// 每个“车轮转一圈”对应编码器计数（非常关键，先估值后实测校准）
+// 例：电机编码器13线 * 30减速比 * X1计数 = 390
+static const float COUNTS_PER_WHEEL_REV = 390.0f;
+
+// ========= 控制参数 =========
+static const float PWM_FREQ_HZ   = 2000.0f;  // 2kHz
+static const float PWM_MOVE_BASE = 0.25f;    // 直行基础占空比
+static const float PWM_TURN_BASE = 0.24f;    // 掉头基础占空比
+static const float PWM_MIN_EFF   = 0.16f;    // 最小有效占空比（克服静摩擦）
+
+static const float KP_SYNC_MOVE  = 0.0022f;  // 直行左右同步P
+static const float KP_SYNC_TURN  = 0.0028f;  // 掉头左右同步P
+
+static const float CTRL_DT_S     = 0.01f;    // 控制周期 10ms
+static const int   TIMEOUT_MOVE_MS = 10000;  // 直行超时
+static const int   TIMEOUT_TURN_MS = 8000;   // 掉头超时
+
+// 若前进方向反了，把对应值改成0
+static const int LEFT_FWD_LEVEL  = 1;
+static const int RIGHT_FWD_LEVEL = 1;
+
+// ========= ISR =========
+void isr_enc_l_rise() { g_enc_l += g_sign_l; }
+void isr_enc_r_rise() { g_enc_r += g_sign_r; }
+
+// ========= 编码器读写 =========
+void reset_encoders() {
+    __disable_irq();
+    g_enc_l = 0;
+    g_enc_r = 0;
+    __enable_irq();
+}
+
+void read_encoders(int32_t &l, int32_t &r) {
+    __disable_irq();
+    l = g_enc_l;
+    r = g_enc_r;
+    __enable_irq();
+}
+
+// ========= 运动基础 =========
+void set_left_speed(float u) {
+    // u: [-1, +1]
+    if (u >= 0.0f) {
+        L_DIR = LEFT_FWD_LEVEL;
+        g_sign_l = +1;
+    } else {
+        L_DIR = !LEFT_FWD_LEVEL;
+        g_sign_l = -1;
+    }
+
+    float duty = fabs(u);
+    if (duty > 0.0f && duty < PWM_MIN_EFF) duty = PWM_MIN_EFF;
+    duty = clampf(duty, 0.0f, 1.0f);
+    L_PWM.write(duty);
+}
+
+void set_right_speed(float u) {
+    if (u >= 0.0f) {
+        R_DIR = RIGHT_FWD_LEVEL;
+        g_sign_r = +1;
+    } else {
+        R_DIR = !RIGHT_FWD_LEVEL;
+        g_sign_r = -1;
+    }
+
+    float duty = fabs(u);
+    if (duty > 0.0f && duty < PWM_MIN_EFF) duty = PWM_MIN_EFF;
+    duty = clampf(duty, 0.0f, 1.0f);
+    R_PWM.write(duty);
+}
+
+void stop_all() {
+    L_PWM.write(0.0f);
+    R_PWM.write(0.0f);
+}
+
+// ========= 单位换算 =========
+int32_t meters_to_ticks(float meters) {
+    float wheel_circ = PI_F * WHEEL_DIAMETER_M;
+    float ticks_per_meter = COUNTS_PER_WHEEL_REV / wheel_circ;
+    return round_i32(meters * ticks_per_meter);
+}
+
+// 原地转deg时，每个轮子要走的弧长：s = pi * TRACK_WIDTH * deg / 360
+int32_t turn_deg_to_ticks_each_wheel(float deg) {
+    float s_each = PI_F * TRACK_WIDTH_M * (fabs(deg) / 360.0f);
+    return meters_to_ticks(s_each);
+}
+
+// ========= 闭环动作 =========
+bool move_straight_m(float dist_m) {
+    int32_t target = meters_to_ticks(dist_m);
+    if (target <= 0) return true;
+
+    reset_encoders();
+    Timer t;
+    t.start();
+
+    while (1) {
+        int32_t l, r;
+        read_encoders(l, r);
+
+        int32_t la = iabs32(l);
+        int32_t ra = iabs32(r);
+        int32_t avg = (la + ra) / 2;
+        int32_t remain = target - avg;
+
+        if (remain <= 0) break;
+        if (t.read_ms() > TIMEOUT_MOVE_MS) {
+            stop_all();
+            return false;
+        }
+
+        // 临近终点减速
+        float base = PWM_MOVE_BASE;
+        int32_t slow_zone = target / 3;
+        if (slow_zone < 1) slow_zone = 1;
+        if (remain < slow_zone) {
+            float k = (float)remain / (float)slow_zone; // 1 -> 0
+            base = PWM_MIN_EFF + (PWM_MOVE_BASE - PWM_MIN_EFF) * k;
+        }
+
+        // 左右里程同步闭环
+        float err = (float)(la - ra);  // 左大于右 => 左偏快
+        float corr = KP_SYNC_MOVE * err;
+
+        float uL = base - corr;
+        float uR = base + corr;
+
+        set_left_speed(+uL);
+        set_right_speed(+uR);
+
+        wait(CTRL_DT_S);
+    }
+
+    stop_all();
+    wait(0.12f);
+    return true;
+}
+
+bool turn_in_place_deg(float deg) {
+    int32_t target = turn_deg_to_ticks_each_wheel(deg);
+    if (target <= 0) return true;
+
+    reset_encoders();
+    Timer t;
+    t.start();
+
+    while (1) {
+        int32_t l, r;
+        read_encoders(l, r);
+
+        int32_t la = iabs32(l);
+        int32_t ra = iabs32(r);
+        int32_t avg = (la + ra) / 2;
+        int32_t remain = target - avg;
+
+        if (remain <= 0) break;
+        if (t.read_ms() > TIMEOUT_TURN_MS) {
+            stop_all();
+            return false;
+        }
+
+        // 临近终点减速
+        float base = PWM_TURN_BASE;
+        int32_t slow_zone = target / 3;
+        if (slow_zone < 1) slow_zone = 1;
+        if (remain < slow_zone) {
+            float k = (float)remain / (float)slow_zone;
+            base = PWM_MIN_EFF + (PWM_TURN_BASE - PWM_MIN_EFF) * k;
+        }
+
+        // 掉头时左右计数同步
+        float err = (float)(la - ra);
+        float corr = KP_SYNC_TURN * err;
+
+        float uL = base - corr;   // 左轮前进
+        float uR = base + corr;   // 右轮后退（下面取负）
+
+        set_left_speed(+uL);
+        set_right_speed(-uR);
+
+        wait(CTRL_DT_S);
+    }
+
+    stop_all();
+    wait(0.15f);
+    return true;
+}
+
+int main() {
+    // PWM频率
+    L_PWM.period(1.0f / PWM_FREQ_HZ);
+    R_PWM.period(1.0f / PWM_FREQ_HZ);
+
+    // 电机板使能
+    M_EN_GLOBAL = 1;
+    M_AUX = 1;
+    L_EN = 1;
+    R_EN = 1;
+
+    // 编码器中断（X1：上升沿计数）
+    ENC_L.rise(&isr_enc_l_rise);
+    ENC_R.rise(&isr_enc_r_rise);
+
+    // ===== 任务序列 =====
+    bool ok1 = move_straight_m(0.50f);
+    bool ok2 = turn_in_place_deg(180.0f);
+    bool ok3 = move_straight_m(0.50f);
+
+    stop_all();
+
+    // 结束后保持空转
+    while (1) {
+        // 你可以加LED/串口指示 ok1/ok2/ok3
+        wait(0.2f);
+    }
+}
