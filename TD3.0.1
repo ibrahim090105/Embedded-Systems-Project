@@ -1,0 +1,1148 @@
+#include "mbed.h"
+#include "QEI.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cmath>
+
+/*
+ * TD3 循迹小车控制程序（mbed2 / STM32F401RE）
+ * ---------------------------------------------------------
+ * 设计目标：
+ * 1. 便于修改：所有引脚、极性、增益、阈值都集中放在文件顶部。
+ * 2. 采用 ISR 驱动调度：1 ms 定时中断只负责累计任务计数，较重计算全部留在 main() 中执行。
+ * 3. 传感器更稳健：每次更新都先读环境光（LED 关），再读反射光（LED 开），两者相减以抵消环境光与偏置。
+ * 4. 控制结构清晰：
+ *      - 内环：左右轮速度 PI
+ *      - 外环：线位置 -> 转向修正
+ *      - 状态机：循迹 / 掉头 / 停车 / 等待 BLE / 各种调试模式
+ * 5. 便于调试：使用 BLE 单字符命令切换模式并控制上报。
+ *
+ * 首次上车前务必检查：
+ * - 根据当前接线确认 MOTOR_*_FORWARD_LEVEL 是否正确。
+ * - 确认 ENCODER_*_SIGN，使前进时速度读数为正。
+ * - 使用 MODE_SENSOR_DEBUG 调整 LINE_WHITE_EST / LINE_BLACK_EST 与相关阈值。
+ * - 调整 MAX_WHEEL_PPS、速度 PI 参数以及循迹转向参数。
+ */
+
+/* ========================================================================== */
+/*                                  引脚定义                                  */
+/* ========================================================================== */
+
+// ---- 电机驱动 ----
+static const PinName PIN_MOTOR_L_BIPOLAR = PA_8;
+static const PinName PIN_MOTOR_L_DIR     = PB_10;
+static const PinName PIN_MOTOR_L_PWM     = PB_4;
+
+static const PinName PIN_MOTOR_R_BIPOLAR = PB_5;
+static const PinName PIN_MOTOR_R_DIR     = PB_3;
+static const PinName PIN_MOTOR_R_PWM     = PA_10;
+
+static const PinName PIN_MOTOR_ENABLE    = PB_8;   // 已确认的最新版本
+
+// ---- 编码器 ----
+static const PinName PIN_ENC_L_A         = PA_0;
+static const PinName PIN_ENC_L_B         = PA_1;
+static const PinName PIN_ENC_R_A         = PC_8;
+static const PinName PIN_ENC_R_B         = PC_6;
+
+// ---- BLE（HM-10） ----
+static const PinName PIN_BLE_TX          = PA_11;
+static const PinName PIN_BLE_RX          = PA_12;
+
+// ---- 可选 USB 串口调试 ----
+static const PinName PIN_PC_TX           = USBTX;
+static const PinName PIN_PC_RX           = USBRX;
+
+// ---- 线传感器模拟输入 ----
+// 当前接线对应的物理顺序：
+// TR1（最左）-> PC2，TR2 -> PC3，TR3 -> PA4，TR4 -> PB0，TR5 -> PC1，TR6（最右）-> PC0
+static const PinName PIN_LINE_ADC_PHYS[6] = {
+    PC_2, PC_3, PA_4, PB_0, PC_1, PC_0
+};
+
+// ---- 线传感器发光端控制（高电平使能） ----
+static const PinName PIN_LINE_LED_PHYS[6] = {
+    PA_5, PA_6, PA_7, PB_6, PC_7, PA_9
+};
+
+/* ========================================================================== */
+/*                              硬件极性与方向定义                             */
+/* ========================================================================== */
+
+// 电机驱动逻辑
+static const int  MOTOR_L_FORWARD_LEVEL = 0;   // 若左电机前进方向相反则改这里
+static const int  MOTOR_R_FORWARD_LEVEL = 0;   // 若右电机前进方向相反则改这里
+static const bool MOTOR_PWM_INVERTED    = true;  // 保留直观接口：0 = 停止，100 = 满动力
+static const bool MOTOR_ENABLE_ACTIVE_HIGH = true;
+static const bool MOTOR_BIPOLAR_FIXED_LOW = true; // 与旧代码一致，bipolar 固定拉低
+
+// 编码器符号修正：保证前进时测得速度为正
+static const int ENCODER_L_SIGN = +1;  // 若前进时读数为负，则改为 -1
+static const int ENCODER_R_SIGN = +1;  // 若前进时读数为负，则改为 -1
+
+// 线传感器逻辑
+static const bool LINE_LED_ACTIVE_HIGH = true;
+// 逻辑下标 0..5 表示 从左到右；通过该表映射到上面的物理通道。
+// 若传感器顺序或排线变化，只修改这里即可。
+static const int LINE_LOGICAL_TO_PHYSICAL[6] = {0, 1, 2, 3, 4, 5};
+
+// 用于计算线位置的权重，保持关于 0 对称。
+static const float LINE_POSITION_WEIGHTS[6] = {-250.0f, -150.0f, -50.0f, 50.0f, 150.0f, 250.0f};
+
+/* ========================================================================== */
+/*                              定时与调度参数配置                             */
+/* ========================================================================== */
+
+static const uint32_t TICK_ISR_US              = 1000;   // 1 ms 基础调度节拍
+static const uint32_t SENSOR_TASK_PERIOD_MS    = 5;      // 200 Hz 线传感器更新频率
+static const uint32_t CONTROL_TASK_PERIOD_MS   = 1;      // 速度内环实际执行周期
+static const uint32_t STATE_TASK_PERIOD_MS     = 20;     // 50 Hz：BLE + 状态机 + 调试输出
+static const uint32_t CPU_REPORT_PERIOD_MS     = 5000;   // 每 5 秒一次 CPU 占用率上报
+static const uint32_t DEBUG_STREAM_PERIOD_MS   = 200;    // 调试模式下的周期性数据流输出
+
+// 切换 LED 后，等待传感器稳定的时间
+static const int LINE_LED_OFF_SETTLE_US        = 60;
+static const int LINE_LED_ON_SETTLE_US         = 60;
+static const int LINE_ADC_AVG_SAMPLES          = 3;      // 每个阶段采样多次再平均，进一步抑制噪声
+
+/* ========================================================================== */
+/*                                控制参数配置                                 */
+/* ========================================================================== */
+
+// 对上层统一使用 0..100 的速度百分比
+static const float BASE_FOLLOW_SPEED_PCT       = 30.0f;
+static const float MAX_FOLLOW_SPEED_PCT        = 45.0f;
+static const float MIN_FOLLOW_SPEED_PCT        = 12.0f;
+static const float TURNAROUND_SPEED_PCT        = 28.0f;
+static const float LOST_LINE_SEARCH_SPEED_PCT  = 18.0f;
+static const float STOPPING_DECEL_PCT_PER_S    = 80.0f;  // 越大表示减速越快
+
+// 轮速标定：指令约为 100% 时测得的最大脉冲每秒
+// 这个值建议用 MODE_ENCODER_DEBUG 实测后调整。
+static const float MAX_WHEEL_PPS               = 2200.0f;
+static const float SPEED_FILTER_ALPHA          = 0.25f;  // 0..1，越大响应越快，但噪声也更大
+
+// 速度 PI（内环），单位仍然是百分比
+static const float SPEED_KP                    = 0.90f;
+static const float SPEED_KI                    = 4.00f;
+static const float SPEED_INTEGRAL_CLAMP        = 35.0f;
+
+// 循迹转向（外环）
+static const float LINE_STEER_KP               = 0.080f;
+static const float LINE_STEER_KD               = 0.035f;
+static const float LINE_STEER_MAX              = 22.0f;
+
+// End-of-line / lost-line timing
+static const uint32_t LOST_LINE_RECOVER_MS     = 150;    // 小于该时间的丢线视为可恢复的短暂丢线
+static const uint32_t END_OF_LINE_CONFIRM_MS   = 350;    // 连续丢线超过该时间，则判定为终点并自主停车
+static const uint32_t LINE_RECENTLY_VISIBLE_MS = 400;    // 只有最近确实看见过线，才允许进入终点判定
+
+// 掉头通过编码器计数控制，先用估计值，后续实测再调
+static const int TURNAROUND_180_TICKS          = 1260;
+
+/* ========================================================================== */
+/*                              线传感器归一化参数                              */
+/* ========================================================================== */
+
+// 这些值是做完补偿（LED 开 - LED 关）之后的结果，单位是 AnalogIn 的 0..1 归一化值。
+// 初始先用估计值，后续通过 MODE_SENSOR_DEBUG 调整。
+static float LINE_BLACK_EST[6] = {0.015f, 0.015f, 0.015f, 0.015f, 0.015f, 0.015f};
+static float LINE_WHITE_EST[6] = {0.220f, 0.220f, 0.220f, 0.220f, 0.220f, 0.220f};
+
+static const float LINE_VISIBLE_SUM_THRESHOLD   = 0.80f;  // 六路总和很强时，认为有线
+static const float LINE_VISIBLE_MAX_THRESHOLD   = 0.18f;  // 单路明显强时，认为有线
+static const float LINE_VISIBLE_PAIR_THRESHOLD  = 0.30f;  // 相邻两路之和足够时，也认为有线（用于线夹在两传感器中间）
+
+// 可选：缓慢自适应黑/白参考值；调试初期建议打开，方便上车。
+// 自适应策略升级为“门控式”：
+// - 只有明确处于背景时才更新 black
+// - 只有明确看见较强白线时才尝试上调 white
+static const bool  LINE_AUTO_ADAPT             = true;
+static const float LINE_ADAPT_RATE_MIN         = 0.01f;
+static const float LINE_ADAPT_RATE_MAX         = 0.01f;
+static const float LINE_ADAPT_BLACK_SUM_MAX    = 0.22f;  // 明显背景时，总强度上限
+static const float LINE_ADAPT_BLACK_MAX_MAX    = 0.10f;  // 明显背景时，单路最大归一化上限
+static const float LINE_ADAPT_WHITE_MAX_MIN    = 0.72f;  // 明显看到白线中心时，单路最大归一化下限
+static const float LINE_ADAPT_WHITE_PAIR_MIN   = 0.90f;  // 白线压在两路中间时，相邻两路归一化和下限
+static const float LINE_WHITE_FLOOR_MARGIN     = 0.02f;  // 保证 white 始终高于 black
+
+/* ========================================================================== */
+/*                                调试与遥测配置                               */
+/* ========================================================================== */
+
+static bool ENABLE_USB_DEBUG_OUTPUT            = true;
+static bool ENABLE_BLE_DEBUG_OUTPUT            = true;
+static bool ENABLE_CPU_REPORT                  = true;
+static bool ENABLE_STREAMING_DEBUG             = true;
+
+/* ========================================================================== */
+/*                                 BLE 命令定义                                */
+/* ========================================================================== */
+
+// 大写字符用于模式/状态控制；小写字符主要用于手动调试
+static const char CMD_MODE_IDLE        = '0';
+static const char CMD_MODE_SENSOR_DBG  = '1';
+static const char CMD_MODE_MOTOR_DBG   = '2';
+static const char CMD_MODE_ENCODER_DBG = '3';
+static const char CMD_MODE_BLE_DBG     = '4';
+static const char CMD_MODE_TD3_RUN     = '5';
+
+static const char CMD_START            = 'G'; // 开始 / 恢复运行
+static const char CMD_HALT             = 'H'; // 强制停止并回到空闲态
+static const char CMD_TURNAROUND       = 'U'; // 请求立即执行掉头
+static const char CMD_RESET_FAULTS     = 'R'; // 清除标志并回到空闲态
+static const char CMD_PRINT_ONESHOT    = 'P'; // 输出一条状态摘要
+static const char CMD_CPU_REPORT_TGL   = 'C'; // 开关周期性 CPU 占用率上报
+static const char CMD_STREAM_TGL       = 'D'; // 开关周期性流式调试输出
+
+// 电机手动调试命令（建议在 MODE_MOTOR_DEBUG 下使用）
+static const char CMD_MOTOR_STOP       = 'x';
+static const char CMD_MOTOR_FWD        = 'f';
+static const char CMD_MOTOR_REV        = 'b';
+static const char CMD_MOTOR_LEFT       = 'l';
+static const char CMD_MOTOR_RIGHT      = 'r';
+
+/* ========================================================================== */
+/*                                   枚举定义                                  */
+/* ========================================================================== */
+
+enum RunMode {
+    MODE_IDLE = 0,
+    MODE_SENSOR_DEBUG,
+    MODE_MOTOR_DEBUG,
+    MODE_ENCODER_DEBUG,
+    MODE_BLE_DEBUG,
+    MODE_TD3_RUN
+};
+
+enum VehicleState {
+    STATE_BOOT = 0,
+    STATE_CALIBRATE,
+    STATE_IDLE,
+    STATE_FOLLOW_LINE,
+    STATE_TURNAROUND_EXEC,
+    STATE_STOPPING,
+    STATE_STOPPED_WAIT_BLE,
+    STATE_LOST_LINE,
+    STATE_FAULT
+};
+
+/* ========================================================================== */
+/*                                  全局对象                                   */
+/* ========================================================================== */
+
+Serial pc(PIN_PC_TX, PIN_PC_RX);
+Serial hm10(PIN_BLE_TX, PIN_BLE_RX);
+Ticker schedulerTicker;
+Timer  runTimer;
+
+class Motor {
+public:
+    Motor(PinName bipolarPin, PinName dirPin, PinName pwmPin,
+          int forwardLevel, bool pwmInverted, bool bipolarFixedLow)
+        : bipolar_(bipolarPin), dir_(dirPin), pwm_(pwmPin),
+          forwardLevel_(forwardLevel), pwmInverted_(pwmInverted), bipolarFixedLow_(bipolarFixedLow) {
+        pwm_.period_us(200); // PWM 频率约 5 kHz
+        if (bipolarFixedLow_) {
+            bipolar_ = 0;
+        } else {
+            bipolar_ = 0;
+        }
+        stop();
+    }
+
+    void stop() {
+        apply(0.0f);
+    }
+
+    // 对上层提供带符号的百分比速度指令，范围 [-100, 100]
+    void setSigned(float signedPercent) {
+        if (signedPercent > 100.0f) signedPercent = 100.0f;
+        if (signedPercent < -100.0f) signedPercent = -100.0f;
+
+        if (signedPercent >= 0.0f) {
+            dir_ = forwardLevel_ ? 1 : 0;
+            apply(signedPercent);
+        } else {
+            dir_ = forwardLevel_ ? 0 : 1;
+            apply(-signedPercent);
+        }
+    }
+
+private:
+    void apply(float magnitudePercent) {
+        if (magnitudePercent < 0.0f) magnitudePercent = 0.0f;
+        if (magnitudePercent > 100.0f) magnitudePercent = 100.0f;
+        float duty = magnitudePercent / 100.0f;
+        if (pwmInverted_) {
+            duty = 1.0f - duty;
+        }
+        pwm_.write(duty);
+    }
+
+    DigitalOut bipolar_;
+    DigitalOut dir_;
+    PwmOut     pwm_;
+    int        forwardLevel_;
+    bool       pwmInverted_;
+    bool       bipolarFixedLow_;
+};
+
+Motor leftMotor (PIN_MOTOR_L_BIPOLAR, PIN_MOTOR_L_DIR, PIN_MOTOR_L_PWM,
+                 MOTOR_L_FORWARD_LEVEL, MOTOR_PWM_INVERTED, MOTOR_BIPOLAR_FIXED_LOW);
+Motor rightMotor(PIN_MOTOR_R_BIPOLAR, PIN_MOTOR_R_DIR, PIN_MOTOR_R_PWM,
+                 MOTOR_R_FORWARD_LEVEL, MOTOR_PWM_INVERTED, MOTOR_BIPOLAR_FIXED_LOW);
+DigitalOut motorEnable(PIN_MOTOR_ENABLE);
+
+QEI leftEncoder (PIN_ENC_L_A, PIN_ENC_L_B, NC, 600, QEI::X4_ENCODING);
+QEI rightEncoder(PIN_ENC_R_A, PIN_ENC_R_B, NC, 600, QEI::X4_ENCODING);
+
+AnalogIn lineAdc0(PIN_LINE_ADC_PHYS[0]);
+AnalogIn lineAdc1(PIN_LINE_ADC_PHYS[1]);
+AnalogIn lineAdc2(PIN_LINE_ADC_PHYS[2]);
+AnalogIn lineAdc3(PIN_LINE_ADC_PHYS[3]);
+AnalogIn lineAdc4(PIN_LINE_ADC_PHYS[4]);
+AnalogIn lineAdc5(PIN_LINE_ADC_PHYS[5]);
+AnalogIn* lineAdcPhys[6] = {&lineAdc0, &lineAdc1, &lineAdc2, &lineAdc3, &lineAdc4, &lineAdc5};
+
+DigitalOut lineLed0(PIN_LINE_LED_PHYS[0]);
+DigitalOut lineLed1(PIN_LINE_LED_PHYS[1]);
+DigitalOut lineLed2(PIN_LINE_LED_PHYS[2]);
+DigitalOut lineLed3(PIN_LINE_LED_PHYS[3]);
+DigitalOut lineLed4(PIN_LINE_LED_PHYS[4]);
+DigitalOut lineLed5(PIN_LINE_LED_PHYS[5]);
+DigitalOut* lineLedPhys[6] = {&lineLed0, &lineLed1, &lineLed2, &lineLed3, &lineLed4, &lineLed5};
+
+/* ========================================================================== */
+/*                                  全局状态                                   */
+/* ========================================================================== */
+
+volatile uint32_t dueCtrl = 0;
+volatile uint32_t due5ms  = 0;
+volatile uint32_t due20ms = 0;
+volatile uint32_t due5s   = 0;
+volatile uint32_t sysMs   = 0;
+
+RunMode      currentMode  = MODE_IDLE;
+VehicleState currentState = STATE_BOOT;
+
+char lastBleChar = 0;
+bool turnaroundRequested = false;
+
+// 线传感器缓存：先按物理顺序，再转换成逻辑左右顺序
+float lineAmbientPhys[6] = {0};
+float lineLitPhys[6]     = {0};
+float lineSignalPhys[6]  = {0};
+
+float lineAmbient[6]     = {0}; // 逻辑顺序：从左到右
+float lineLit[6]         = {0};
+float lineSignal[6]      = {0};
+float lineNorm[6]        = {0};
+
+float linePosition       = 0.0f;
+float lineError          = 0.0f;
+float lineErrorPrev      = 0.0f;
+float lineStrength       = 0.0f;
+float lineMaxNorm        = 0.0f;
+float linePairMaxNorm    = 0.0f;
+int   lineMaxIndex       = -1;
+int   linePairIndex      = -1;
+bool  lineVisible        = false;
+uint32_t lineLostMs      = 0;
+uint32_t lastLineSeenMs  = 0;
+
+// 编码器与速度估计
+int32_t prevPulsesL      = 0;
+int32_t prevPulsesR      = 0;
+float actualSpeedLPct    = 0.0f;  // 带符号的百分比速度，已滤波
+float actualSpeedRPct    = 0.0f;
+float targetSpeedLPct    = 0.0f;  // 带符号的目标速度百分比
+float targetSpeedRPct    = 0.0f;
+float motorCmdLPct       = 0.0f;  // PI 之后的带符号电机输出百分比
+float motorCmdRPct       = 0.0f;
+float speedIntL          = 0.0f;
+float speedIntR          = 0.0f;
+
+// 停车 / 掉头动作相关变量
+float stoppingSpeedPct   = 0.0f;
+bool  turnaroundEntry    = false;
+
+// CPU 占用率近似估计：统计 main() 中各周期任务耗时
+uint64_t busyUsAccum     = 0;
+uint32_t lastCpuReportUs = 0;
+
+// 电机手动调试默认速度
+float motorDebugPct      = 20.0f;
+
+/* ========================================================================== */
+/*                                  工具函数                                   */
+/* ========================================================================== */
+
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static inline uint32_t now_us() {
+    return runTimer.read_us();
+}
+
+void debug_printf(const char* fmt, ...) {
+    char buffer[220];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    if (ENABLE_USB_DEBUG_OUTPUT) {
+        pc.printf("%s", buffer);
+    }
+    if (ENABLE_BLE_DEBUG_OUTPUT) {
+        hm10.printf("%s", buffer);
+    }
+}
+
+const char* mode_name(RunMode mode) {
+    switch (mode) {
+        case MODE_IDLE:          return "IDLE";
+        case MODE_SENSOR_DEBUG:  return "SENSOR_DBG";
+        case MODE_MOTOR_DEBUG:   return "MOTOR_DBG";
+        case MODE_ENCODER_DEBUG: return "ENC_DBG";
+        case MODE_BLE_DEBUG:     return "BLE_DBG";
+        case MODE_TD3_RUN:       return "TD3_RUN";
+        default:                 return "UNKNOWN_MODE";
+    }
+}
+
+const char* state_name(VehicleState state) {
+    switch (state) {
+        case STATE_BOOT:             return "BOOT";
+        case STATE_CALIBRATE:        return "CALIBRATE";
+        case STATE_IDLE:             return "IDLE";
+        case STATE_FOLLOW_LINE:      return "FOLLOW_LINE";
+        case STATE_TURNAROUND_EXEC:  return "TURNAROUND_EXEC";
+        case STATE_STOPPING:         return "STOPPING";
+        case STATE_STOPPED_WAIT_BLE: return "STOPPED_WAIT_BLE";
+        case STATE_LOST_LINE:        return "LOST_LINE";
+        case STATE_FAULT:            return "FAULT";
+        default:                     return "UNKNOWN_STATE";
+    }
+}
+
+void set_all_line_leds(bool on) {
+    const int level = (LINE_LED_ACTIVE_HIGH ? (on ? 1 : 0) : (on ? 0 : 1));
+    for (int i = 0; i < 6; ++i) {
+        *lineLedPhys[i] = level;
+    }
+}
+
+void set_motor_enable(bool on) {
+    motorEnable = (MOTOR_ENABLE_ACTIVE_HIGH ? (on ? 1 : 0) : (on ? 0 : 1));
+}
+
+void stop_all_motors() {
+    targetSpeedLPct = 0.0f;
+    targetSpeedRPct = 0.0f;
+    motorCmdLPct = 0.0f;
+    motorCmdRPct = 0.0f;
+    speedIntL = 0.0f;
+    speedIntR = 0.0f;
+    leftMotor.stop();
+    rightMotor.stop();
+}
+
+void reset_motion_state() {
+    leftEncoder.reset();
+    rightEncoder.reset();
+    prevPulsesL = 0;
+    prevPulsesR = 0;
+    actualSpeedLPct = 0.0f;
+    actualSpeedRPct = 0.0f;
+    targetSpeedLPct = 0.0f;
+    targetSpeedRPct = 0.0f;
+    motorCmdLPct = 0.0f;
+    motorCmdRPct = 0.0f;
+    speedIntL = 0.0f;
+    speedIntR = 0.0f;
+}
+
+void print_status_once() {
+    debug_printf(
+        "STAT mode=%s state=%s ble=%c lineVis=%d lineErr=%.2f linePos=%.2f lineStr=%.2f "
+        "spdL=%.1f spdR=%.1f tgtL=%.1f tgtR=%.1f cmdL=%.1f cmdR=%.1f\r\n",
+        mode_name(currentMode), state_name(currentState), (lastBleChar ? lastBleChar : '-'),
+        lineVisible ? 1 : 0, lineError, linePosition, lineStrength,
+        actualSpeedLPct, actualSpeedRPct, targetSpeedLPct, targetSpeedRPct, motorCmdLPct, motorCmdRPct
+    );
+}
+
+/* ========================================================================== */
+/*                                  调度器 ISR                                 */
+/* ========================================================================== */
+
+void scheduler_isr() {
+    sysMs++;
+
+    if ((sysMs % CONTROL_TASK_PERIOD_MS) == 0) {
+        dueCtrl++;
+    }
+    if ((sysMs % SENSOR_TASK_PERIOD_MS) == 0) {
+        due5ms++;
+    }
+    if ((sysMs % STATE_TASK_PERIOD_MS) == 0) {
+        due20ms++;
+    }
+    if ((sysMs % CPU_REPORT_PERIOD_MS) == 0) {
+        due5s++;
+    }
+}
+
+static inline uint32_t fetch_due(volatile uint32_t& due) {
+    __disable_irq();
+    uint32_t n = due;
+    due = 0;
+    __enable_irq();
+    return n;
+}
+
+/* ========================================================================== */
+/*                           线传感器读取与位置估计                            */
+/* ========================================================================== */
+
+void remap_line_arrays_to_logical_order() {
+    for (int logical = 0; logical < 6; ++logical) {
+        const int phys = LINE_LOGICAL_TO_PHYSICAL[logical];
+        lineAmbient[logical] = lineAmbientPhys[phys];
+        lineLit[logical]     = lineLitPhys[phys];
+        lineSignal[logical]  = lineSignalPhys[phys];
+    }
+}
+
+void adapt_line_estimates() {
+    if (!LINE_AUTO_ADAPT) return;
+
+    const bool definitelyBackground =
+        (lineStrength <= LINE_ADAPT_BLACK_SUM_MAX) &&
+        (lineMaxNorm  <= LINE_ADAPT_BLACK_MAX_MAX);
+
+    const bool strongSingleWhite = (lineMaxNorm >= LINE_ADAPT_WHITE_MAX_MIN) && (lineMaxIndex >= 0);
+    const bool strongPairWhite   = (linePairMaxNorm >= LINE_ADAPT_WHITE_PAIR_MIN) && (linePairIndex >= 0);
+
+    // 只有明确处于背景时，才缓慢更新 black；这样可避免白线压在两路中间时污染黑参考。
+    if (definitelyBackground) {
+        for (int i = 0; i < 6; ++i) {
+            LINE_BLACK_EST[i] += LINE_ADAPT_RATE_MIN * (lineSignal[i] - LINE_BLACK_EST[i]);
+        }
+    }
+
+    // white 只做“门控式上调”，避免中间态或弱响应把 white 往下拉。
+    if (strongSingleWhite) {
+        const int i = lineMaxIndex;
+        if (lineSignal[i] > LINE_WHITE_EST[i]) {
+            LINE_WHITE_EST[i] += LINE_ADAPT_RATE_MAX * (lineSignal[i] - LINE_WHITE_EST[i]);
+        }
+    }
+    if (strongPairWhite) {
+        for (int k = 0; k < 2; ++k) {
+            const int i = linePairIndex + k;
+            if (i >= 0 && i < 6 && lineSignal[i] > LINE_WHITE_EST[i]) {
+                LINE_WHITE_EST[i] += LINE_ADAPT_RATE_MAX * (lineSignal[i] - LINE_WHITE_EST[i]);
+            }
+        }
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        if (LINE_WHITE_EST[i] < LINE_BLACK_EST[i] + LINE_WHITE_FLOOR_MARGIN) {
+            LINE_WHITE_EST[i] = LINE_BLACK_EST[i] + LINE_WHITE_FLOOR_MARGIN;
+        }
+    }
+}
+
+void read_line_sensors_compensated() {
+    // 1) 关闭 LED，多次采样环境光并平均。
+    set_all_line_leds(false);
+    wait_us(LINE_LED_OFF_SETTLE_US);
+    for (int i = 0; i < 6; ++i) {
+        lineAmbientPhys[i] = 0.0f;
+    }
+    for (int sample = 0; sample < LINE_ADC_AVG_SAMPLES; ++sample) {
+        for (int i = 0; i < 6; ++i) {
+            lineAmbientPhys[i] += lineAdcPhys[i]->read();
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        lineAmbientPhys[i] /= (float)LINE_ADC_AVG_SAMPLES;
+    }
+
+    // 2) 打开 LED，多次采样总光强（环境光 + 反射光）并平均。
+    set_all_line_leds(true);
+    wait_us(LINE_LED_ON_SETTLE_US);
+    for (int i = 0; i < 6; ++i) {
+        lineLitPhys[i] = 0.0f;
+    }
+    for (int sample = 0; sample < LINE_ADC_AVG_SAMPLES; ++sample) {
+        for (int i = 0; i < 6; ++i) {
+            lineLitPhys[i] += lineAdcPhys[i]->read();
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        lineLitPhys[i] /= (float)LINE_ADC_AVG_SAMPLES;
+        lineSignalPhys[i] = lineLitPhys[i] - lineAmbientPhys[i];
+        if (lineSignalPhys[i] < 0.0f) lineSignalPhys[i] = 0.0f;
+    }
+
+    remap_line_arrays_to_logical_order();
+
+    // 先用当前 black/white 参考进行归一化、估计位置与可见性。
+    lineStrength    = 0.0f;
+    lineMaxNorm     = 0.0f;
+    linePairMaxNorm = 0.0f;
+    lineMaxIndex    = -1;
+    linePairIndex   = -1;
+    float weightedSum = 0.0f;
+
+    for (int i = 0; i < 6; ++i) {
+        const float denom = (LINE_WHITE_EST[i] - LINE_BLACK_EST[i]);
+        float n = 0.0f;
+        if (denom > 0.0005f) {
+            n = (lineSignal[i] - LINE_BLACK_EST[i]) / denom;
+        }
+        n = clampf(n, 0.0f, 1.0f);
+        lineNorm[i] = n;
+        lineStrength += n;
+        weightedSum += n * LINE_POSITION_WEIGHTS[i];
+
+        if (n > lineMaxNorm) {
+            lineMaxNorm = n;
+            lineMaxIndex = i;
+        }
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        const float pairSum = lineNorm[i] + lineNorm[i + 1];
+        if (pairSum > linePairMaxNorm) {
+            linePairMaxNorm = pairSum;
+            linePairIndex = i;
+        }
+    }
+
+    // 可见判定升级：
+    // 1) 单路明显强 -> 有线
+    // 2) 两路相邻都中等，但和足够大 -> 也算有线（白线压在两传感器中间）
+    // 3) 六路总和很强 -> 有线
+    lineVisible = (lineMaxNorm >= LINE_VISIBLE_MAX_THRESHOLD) ||
+                  (linePairMaxNorm >= LINE_VISIBLE_PAIR_THRESHOLD) ||
+                  (lineStrength >= LINE_VISIBLE_SUM_THRESHOLD);
+
+    // 基于当前观测门控更新 black/white 参考。
+    adapt_line_estimates();
+
+    if (lineVisible && lineStrength > 0.0001f) {
+        linePosition = weightedSum / lineStrength;
+        lineError = linePosition;
+        lastLineSeenMs = sysMs;
+        lineLostMs = 0;
+    } else {
+        lineLostMs += SENSOR_TASK_PERIOD_MS;
+        // 保留上一次 lineError，供丢线恢复和搜索方向使用。
+    }
+}
+
+/* ========================================================================== */
+/*                           编码器、速度估计与 PI 控制                         */
+/* ========================================================================== */
+
+void update_speed_estimates_and_PI() {
+    // 每 CONTROL_TASK_PERIOD_MS 执行一次的带符号编码器增量
+    const int32_t pulsesL = leftEncoder.getPulses();
+    const int32_t pulsesR = rightEncoder.getPulses();
+
+    int32_t deltaL = pulsesL - prevPulsesL;
+    int32_t deltaR = pulsesR - prevPulsesR;
+    prevPulsesL = pulsesL;
+    prevPulsesR = pulsesR;
+
+    deltaL *= ENCODER_L_SIGN;
+    deltaR *= ENCODER_R_SIGN;
+
+    const float controlHz = 1000.0f / (float)CONTROL_TASK_PERIOD_MS;
+    const float instPctL = (deltaL * controlHz / MAX_WHEEL_PPS) * 100.0f;
+    const float instPctR = (deltaR * controlHz / MAX_WHEEL_PPS) * 100.0f;
+
+    actualSpeedLPct += SPEED_FILTER_ALPHA * (instPctL - actualSpeedLPct);
+    actualSpeedRPct += SPEED_FILTER_ALPHA * (instPctR - actualSpeedRPct);
+
+    // 仅在非空闲/非停止状态下运行 PI 速度环
+    if (currentState == STATE_IDLE || currentState == STATE_STOPPED_WAIT_BLE || currentState == STATE_FAULT) {
+        motorCmdLPct = 0.0f;
+        motorCmdRPct = 0.0f;
+        speedIntL = 0.0f;
+        speedIntR = 0.0f;
+    } else {
+        const float dt = CONTROL_TASK_PERIOD_MS / 1000.0f;
+
+        const float errL = targetSpeedLPct - actualSpeedLPct;
+        const float errR = targetSpeedRPct - actualSpeedRPct;
+
+        speedIntL += errL * dt * SPEED_KI;
+        speedIntR += errR * dt * SPEED_KI;
+        speedIntL = clampf(speedIntL, -SPEED_INTEGRAL_CLAMP, SPEED_INTEGRAL_CLAMP);
+        speedIntR = clampf(speedIntR, -SPEED_INTEGRAL_CLAMP, SPEED_INTEGRAL_CLAMP);
+
+        motorCmdLPct = targetSpeedLPct + SPEED_KP * errL + speedIntL;
+        motorCmdRPct = targetSpeedRPct + SPEED_KP * errR + speedIntR;
+
+        motorCmdLPct = clampf(motorCmdLPct, -100.0f, 100.0f);
+        motorCmdRPct = clampf(motorCmdRPct, -100.0f, 100.0f);
+    }
+
+    // 将 PI 输出真正下发到电机
+    leftMotor.setSigned(motorCmdLPct);
+    rightMotor.setSigned(motorCmdRPct);
+}
+
+/* ========================================================================== */
+/*                             BLE 命令与模式处理                              */
+/* ========================================================================== */
+
+void set_mode(RunMode mode) {
+    currentMode = mode;
+    switch (mode) {
+        case MODE_IDLE:
+            currentState = STATE_IDLE;
+            stop_all_motors();
+            break;
+        case MODE_SENSOR_DEBUG:
+        case MODE_ENCODER_DEBUG:
+        case MODE_BLE_DEBUG:
+        case MODE_MOTOR_DEBUG:
+            currentState = STATE_IDLE;
+            stop_all_motors();
+            break;
+        case MODE_TD3_RUN:
+            currentState = STATE_IDLE;
+            stop_all_motors();
+            break;
+        default:
+            break;
+    }
+}
+
+void handle_ble_command(char c) {
+    lastBleChar = c;
+
+    switch (c) {
+        case CMD_MODE_IDLE:
+            set_mode(MODE_IDLE);
+            break;
+        case CMD_MODE_SENSOR_DBG:
+            set_mode(MODE_SENSOR_DEBUG);
+            break;
+        case CMD_MODE_MOTOR_DBG:
+            set_mode(MODE_MOTOR_DEBUG);
+            break;
+        case CMD_MODE_ENCODER_DBG:
+            set_mode(MODE_ENCODER_DEBUG);
+            break;
+        case CMD_MODE_BLE_DBG:
+            set_mode(MODE_BLE_DEBUG);
+            break;
+        case CMD_MODE_TD3_RUN:
+            set_mode(MODE_TD3_RUN);
+            break;
+
+        case CMD_START:
+            if (currentMode == MODE_TD3_RUN) {
+                reset_motion_state();
+                currentState = STATE_FOLLOW_LINE;
+            } else if (currentState == STATE_STOPPED_WAIT_BLE) {
+                currentState = STATE_FOLLOW_LINE;
+            }
+            break;
+
+        case CMD_HALT:
+            currentState = STATE_IDLE;
+            stop_all_motors();
+            break;
+
+        case CMD_TURNAROUND:
+            turnaroundRequested = true;
+            break;
+
+        case CMD_RESET_FAULTS:
+            turnaroundRequested = false;
+            reset_motion_state();
+            currentState = STATE_IDLE;
+            break;
+
+        case CMD_PRINT_ONESHOT:
+            print_status_once();
+            break;
+
+        case CMD_CPU_REPORT_TGL:
+            ENABLE_CPU_REPORT = !ENABLE_CPU_REPORT;
+            debug_printf("CPU_REPORT=%d\r\n", ENABLE_CPU_REPORT ? 1 : 0);
+            break;
+
+        case CMD_STREAM_TGL:
+            ENABLE_STREAMING_DEBUG = !ENABLE_STREAMING_DEBUG;
+            debug_printf("STREAM_DEBUG=%d\r\n", ENABLE_STREAMING_DEBUG ? 1 : 0);
+            break;
+
+        // 电机手动调试命令
+        case CMD_MOTOR_STOP:
+            if (currentMode == MODE_MOTOR_DEBUG) {
+                targetSpeedLPct = 0.0f;
+                targetSpeedRPct = 0.0f;
+            }
+            break;
+        case CMD_MOTOR_FWD:
+            if (currentMode == MODE_MOTOR_DEBUG) {
+                targetSpeedLPct = motorDebugPct;
+                targetSpeedRPct = motorDebugPct;
+            }
+            break;
+        case CMD_MOTOR_REV:
+            if (currentMode == MODE_MOTOR_DEBUG) {
+                targetSpeedLPct = -motorDebugPct;
+                targetSpeedRPct = -motorDebugPct;
+            }
+            break;
+        case CMD_MOTOR_LEFT:
+            if (currentMode == MODE_MOTOR_DEBUG) {
+                targetSpeedLPct = -motorDebugPct;
+                targetSpeedRPct =  motorDebugPct;
+            }
+            break;
+        case CMD_MOTOR_RIGHT:
+            if (currentMode == MODE_MOTOR_DEBUG) {
+                targetSpeedLPct =  motorDebugPct;
+                targetSpeedRPct = -motorDebugPct;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void poll_ble() {
+    while (hm10.readable()) {
+        char c = hm10.getc();
+        handle_ble_command(c);
+    }
+}
+
+/* ========================================================================== */
+/*                            高层控制与状态机逻辑                             */
+/* ========================================================================== */
+
+void update_follow_line_targets() {
+    // 外环只负责生成左右轮目标速度，真正的 PWM 由内环 PI 完成。
+    if (!lineVisible) {
+        currentState = STATE_LOST_LINE;
+        return;
+    }
+
+    const float dt = SENSOR_TASK_PERIOD_MS / 1000.0f;
+    const float dErr = (lineError - lineErrorPrev) / dt;
+    lineErrorPrev = lineError;
+
+    float steer = LINE_STEER_KP * lineError + LINE_STEER_KD * dErr;
+    steer = clampf(steer, -LINE_STEER_MAX, LINE_STEER_MAX);
+
+    // 偏差越大时适当降速，使弯道更平滑。
+    float speedReduction = clampf(fabsf(lineError) / 250.0f, 0.0f, 1.0f);
+    float base = BASE_FOLLOW_SPEED_PCT - speedReduction * 8.0f;
+    base = clampf(base, MIN_FOLLOW_SPEED_PCT, MAX_FOLLOW_SPEED_PCT);
+
+    targetSpeedLPct = clampf(base - steer, -100.0f, 100.0f);
+    targetSpeedRPct = clampf(base + steer, -100.0f, 100.0f);
+
+    if (turnaroundRequested) {
+        currentState = STATE_TURNAROUND_EXEC;
+        turnaroundEntry = true;
+        return;
+    }
+
+    // 终点判定要求：最近看见过线，然后持续消失一段时间。
+    if (!lineVisible) {
+        // 这里前面已经处理过，保留是为了增强可读性
+        return;
+    }
+}
+
+void enter_stopping_state() {
+    currentState = STATE_STOPPING;
+    float avgAbs = 0.5f * (fabsf(actualSpeedLPct) + fabsf(actualSpeedRPct));
+    if (avgAbs < MIN_FOLLOW_SPEED_PCT) avgAbs = BASE_FOLLOW_SPEED_PCT;
+    stoppingSpeedPct = avgAbs;
+}
+
+void update_stopping_targets() {
+    const float dt = SENSOR_TASK_PERIOD_MS / 1000.0f;
+    stoppingSpeedPct -= STOPPING_DECEL_PCT_PER_S * dt;
+    if (stoppingSpeedPct < 0.0f) stoppingSpeedPct = 0.0f;
+
+    targetSpeedLPct = stoppingSpeedPct;
+    targetSpeedRPct = stoppingSpeedPct;
+
+    if (stoppingSpeedPct <= 0.5f && fabsf(actualSpeedLPct) < 2.0f && fabsf(actualSpeedRPct) < 2.0f) {
+        currentState = STATE_STOPPED_WAIT_BLE;
+        stop_all_motors();
+    }
+}
+
+void update_turnaround_targets() {
+    if (turnaroundEntry) {
+        reset_motion_state();
+        turnaroundEntry = false;
+    }
+
+    targetSpeedLPct =  TURNAROUND_SPEED_PCT;
+    targetSpeedRPct = -TURNAROUND_SPEED_PCT;
+
+    const int avgTicks = (abs(leftEncoder.getPulses()) + abs(rightEncoder.getPulses())) / 2;
+    if (avgTicks >= TURNAROUND_180_TICKS) {
+        turnaroundRequested = false;
+        reset_motion_state();
+        currentState = STATE_FOLLOW_LINE;
+    }
+}
+
+void update_lost_line_behavior() {
+    // 先利用上一次误差方向做短时恢复。
+    if (lineVisible) {
+        currentState = STATE_FOLLOW_LINE;
+        return;
+    }
+
+    if ((sysMs - lastLineSeenMs) <= LOST_LINE_RECOVER_MS) {
+        const float steerDir = (lineError >= 0.0f) ? 1.0f : -1.0f;
+        targetSpeedLPct = LOST_LINE_SEARCH_SPEED_PCT - steerDir * 8.0f;
+        targetSpeedRPct = LOST_LINE_SEARCH_SPEED_PCT + steerDir * 8.0f;
+        return;
+    }
+
+    // 若最近确实看见过线，且现在连续丢线足够久，则判定为终点。
+    const uint32_t unseenMs = sysMs - lastLineSeenMs;
+    if (unseenMs <= LINE_RECENTLY_VISIBLE_MS && unseenMs >= END_OF_LINE_CONFIRM_MS) {
+        enter_stopping_state();
+        return;
+    }
+
+    // 否则继续用更温和的搜索动作尝试找回线路。
+    const float steerDir = (lineError >= 0.0f) ? 1.0f : -1.0f;
+    targetSpeedLPct =  0.60f * LOST_LINE_SEARCH_SPEED_PCT - steerDir * 10.0f;
+    targetSpeedRPct =  0.60f * LOST_LINE_SEARCH_SPEED_PCT + steerDir * 10.0f;
+}
+
+void update_vehicle_state_machine() {
+    switch (currentState) {
+        case STATE_BOOT:
+            currentState = STATE_CALIBRATE;
+            break;
+
+        case STATE_CALIBRATE:
+            // 启动标定阶段，电机保持关闭。
+            targetSpeedLPct = 0.0f;
+            targetSpeedRPct = 0.0f;
+            // 初始采样稳定后回到 IDLE。
+            if (sysMs > 300) {
+                currentState = STATE_IDLE;
+            }
+            break;
+
+        case STATE_IDLE:
+            targetSpeedLPct = 0.0f;
+            targetSpeedRPct = 0.0f;
+            break;
+
+        case STATE_FOLLOW_LINE:
+            update_follow_line_targets();
+            break;
+
+        case STATE_TURNAROUND_EXEC:
+            update_turnaround_targets();
+            break;
+
+        case STATE_STOPPING:
+            update_stopping_targets();
+            break;
+
+        case STATE_STOPPED_WAIT_BLE:
+            targetSpeedLPct = 0.0f;
+            targetSpeedRPct = 0.0f;
+            break;
+
+        case STATE_LOST_LINE:
+            update_lost_line_behavior();
+            break;
+
+        case STATE_FAULT:
+        default:
+            targetSpeedLPct = 0.0f;
+            targetSpeedRPct = 0.0f;
+            break;
+    }
+}
+
+/* ========================================================================== */
+/*                                  调试任务                                   */
+/* ========================================================================== */
+
+void stream_sensor_debug() {
+    debug_printf(
+        "SENS amb=[%.3f %.3f %.3f %.3f %.3f %.3f] lit=[%.3f %.3f %.3f %.3f %.3f %.3f] sig=[%.3f %.3f %.3f %.3f %.3f %.3f] norm=[%.2f %.2f %.2f %.2f %.2f %.2f] vis=%d pos=%.1f err=%.1f pair=%.2f max=%d pairIdx=%d\r\n",
+        lineAmbient[0], lineAmbient[1], lineAmbient[2], lineAmbient[3], lineAmbient[4], lineAmbient[5],
+        lineLit[0], lineLit[1], lineLit[2], lineLit[3], lineLit[4], lineLit[5],
+        lineSignal[0], lineSignal[1], lineSignal[2], lineSignal[3], lineSignal[4], lineSignal[5],
+        lineNorm[0], lineNorm[1], lineNorm[2], lineNorm[3], lineNorm[4], lineNorm[5],
+        lineVisible ? 1 : 0, linePosition, lineError, linePairMaxNorm, lineMaxIndex, linePairIndex
+    );
+}
+
+void stream_encoder_debug() {
+    debug_printf(
+        "ENC pulsesL=%ld pulsesR=%ld actL=%.2f actR=%.2f tgtL=%.2f tgtR=%.2f cmdL=%.2f cmdR=%.2f\r\n",
+        (long)leftEncoder.getPulses(), (long)rightEncoder.getPulses(),
+        actualSpeedLPct, actualSpeedRPct, targetSpeedLPct, targetSpeedRPct, motorCmdLPct, motorCmdRPct
+    );
+}
+
+void stream_ble_debug() {
+    debug_printf("BLE last=%c mode=%s state=%s cpu=%d\r\n",
+                 lastBleChar ? lastBleChar : '-', mode_name(currentMode), state_name(currentState), ENABLE_CPU_REPORT ? 1 : 0);
+}
+
+void stream_motor_debug() {
+    debug_printf("MOTOR tgtL=%.1f tgtR=%.1f cmdL=%.1f cmdR=%.1f actL=%.1f actR=%.1f\r\n",
+                 targetSpeedLPct, targetSpeedRPct, motorCmdLPct, motorCmdRPct, actualSpeedLPct, actualSpeedRPct);
+}
+
+void cpu_report_5s() {
+    static uint32_t lastReportTimeUs = 0;
+    const uint32_t now = now_us();
+    const uint32_t elapsed = now - lastReportTimeUs;
+    lastReportTimeUs = now;
+
+    if (elapsed == 0) return;
+
+    // busyUsAccum 统计的是 main() 中各任务耗时，ISR 设计得很轻，这里刻意不计入。
+    float usage = 100.0f * ((float)busyUsAccum / (float)elapsed);
+    if (usage < 0.0f) usage = 0.0f;
+    if (usage > 100.0f) usage = 100.0f;
+
+    if (ENABLE_CPU_REPORT) {
+        debug_printf("CPU usage=%.1f%% mode=%s state=%s\r\n", usage, mode_name(currentMode), state_name(currentState));
+    }
+
+    busyUsAccum = 0;
+}
+
+/* ========================================================================== */
+/*                               周期任务封装函数                              */
+/* ========================================================================== */
+
+void do_control_task() {
+    const uint32_t t0 = now_us();
+    update_speed_estimates_and_PI();
+    busyUsAccum += (now_us() - t0);
+}
+
+void do_5ms_task() {
+    const uint32_t t0 = now_us();
+    read_line_sensors_compensated();
+
+    if (currentMode == MODE_TD3_RUN) {
+        // 由于 lineVisible 每 5 ms 更新一次，因此在这里判断是否进入丢线状态。
+        if (!lineVisible && currentState == STATE_FOLLOW_LINE) {
+            currentState = STATE_LOST_LINE;
+        }
+    }
+
+    busyUsAccum += (now_us() - t0);
+}
+
+void do_20ms_task() {
+    static uint32_t debugDividerMs = 0;
+    const uint32_t t0 = now_us();
+
+    poll_ble();
+    update_vehicle_state_machine();
+
+    debugDividerMs += STATE_TASK_PERIOD_MS;
+    if (ENABLE_STREAMING_DEBUG && debugDividerMs >= DEBUG_STREAM_PERIOD_MS) {
+        debugDividerMs = 0;
+        switch (currentMode) {
+            case MODE_SENSOR_DEBUG:  stream_sensor_debug();  break;
+            case MODE_MOTOR_DEBUG:   stream_motor_debug();   break;
+            case MODE_ENCODER_DEBUG: stream_encoder_debug(); break;
+            case MODE_BLE_DEBUG:     stream_ble_debug();     break;
+            case MODE_TD3_RUN:
+                // 正常运行模式下只输出较简洁的状态摘要
+                print_status_once();
+                break;
+            default:
+                break;
+        }
+    }
+
+    busyUsAccum += (now_us() - t0);
+}
+
+void do_5s_task() {
+    const uint32_t t0 = now_us();
+    cpu_report_5s();
+    busyUsAccum += (now_us() - t0);
+}
+
+/* ========================================================================== */
+/*                                   主函数                                   */
+/* ========================================================================== */
+
+int main() {
+    pc.baud(115200);
+    hm10.baud(9600);
+
+    runTimer.start();
+    lastCpuReportUs = now_us();
+
+    set_motor_enable(true);
+    set_all_line_leds(false);
+    stop_all_motors();
+    reset_motion_state();
+
+    currentMode  = MODE_IDLE;
+    currentState = STATE_BOOT;
+
+    debug_printf("TD3 controller booting...\r\n");
+    debug_printf("BLE cmds: 0/1/2/3/4/5 mode, G start, H halt, U turnaround, C cpu, D stream, P print\r\n");
+    debug_printf("Motor dbg cmds: f b l r x\r\n");
+
+    schedulerTicker.attach_us(&scheduler_isr, TICK_ISR_US);
+
+    while (1) {
+        uint32_t nCtrl = fetch_due(dueCtrl);
+        uint32_t n5  = fetch_due(due5ms);
+        uint32_t n20 = fetch_due(due20ms);
+        uint32_t n5s = fetch_due(due5s);
+
+        while (nCtrl--) {
+            do_control_task();
+        }
+        while (n5--) {
+            do_5ms_task();
+        }
+        while (n20--) {
+            do_20ms_task();
+        }
+        while (n5s--) {
+            do_5s_task();
+        }
+
+            // 适当空转等待，既避免无意义满速忙等，又保持较好响应速度。
+        wait_us(50);
+    }
+}
