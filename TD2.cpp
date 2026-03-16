@@ -97,7 +97,7 @@ class MotorDriveBoard{
 class SensorArray{
     private:
         DigitalOut uln1, uln2, uln3, uln4, uln5, uln6;
-        DigitalOut tr1, tr2, tr3, tr4, tr5, tr6;
+        AnalogIn tr1, tr2, tr3, tr4, tr5, tr6;
     public:
         SensorArray(PinName u1, PinName u2, PinName u3, PinName u4, PinName u5, PinName u6, PinName t1, PinName t2, PinName t3, PinName t4, PinName t5, PinName t6):
         uln1(u1), uln2(u2), uln3(u3), uln4(u4), uln5(u5), uln6(u6), tr1(t1), tr2(t2), tr3(t3), tr4(t4), tr5(t5), tr6(t6){}
@@ -126,7 +126,7 @@ class SensorArray{
             output4 = tr4.read();
             output5 = tr5.read();
             output6 = tr6.read();
-            printf("TCRT 1 : %.2f, TCRT 2 : %.2f, TCRT 3 : %.2f, TCRT 4 : %.2f, TCRT 5 : %.2f, TCRT 6 : %.2f\n", output1, output2, output3, output4, output5, output6);
+            printf("TCRT 1 : %.4f, TCRT 2 : %.4f, TCRT 3 : %.4f, TCRT 4 : %.4f, TCRT 5 : %.4f, TCRT 6 : %.4f\n", output1, output2, output3, output4, output5, output6);
         }              
 };
 //SET UP HM-10 VIA USB SERIAL PORT
@@ -199,15 +199,15 @@ int main()
 
     SensorArray sensorArray(PA_5, PA_6, PA_7, PB_6, PC_7, PA_9, PC_2, PC_3, PA_4, PB_0, PC_1, PC_0);
     //Settings
-    motor.SetMode(0,0); //unipolar
-    motor.SetDutyCycle(0.3,0.3); // low duty cycle
-    motor.SetDirection(0,0); //forward
-    motor.SetPeriod(0.001,0.001);
+     motor.SetMode(0,0); //unipolar
+     motor.SetDutyCycle(0,0); // low duty cycle
+     motor.SetDirection(0,0); //forward
+     motor.SetPeriod(0.001,0.001);
     motor.SetEnable(1);
 
     sensorArray.SetLEDs(1, 1, 1, 1, 1, 1);
     while(1){
-        MeasureWheelVelocity(leftWheel, rightWheel, motor);
+        //MeasureWheelVelocity(leftWheel, rightWheel, motor);
         wait_us(1000);
         DisplayBLESignals();
         wait_us(1000);
