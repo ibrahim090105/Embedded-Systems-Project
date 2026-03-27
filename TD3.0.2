@@ -1,0 +1,526 @@
+/* mbed2 / mbed OS 2
+ * 保存为 main.cpp
+ */
+
+#include "mbed.h"
+#include "QEI.h"
+#include <cstdio>
+#include <cmath>
+
+// ============================================================
+// 基本常量
+// ============================================================
+#define PI_F 3.14159265359f
+
+#define CONTROL_PERIOD_S   0.025f
+#define CONTROL_PERIOD_US  25000
+
+#define LED_SETTLE_US      60
+#define ADC_AVG_SAMPLES    4
+
+// 编码器/底盘参数
+// 注意：如果你 QEI 库返回的不是“每电机轴 256 线 × 4 倍频”的计数，
+// 这里需要按你的实际编码器改
+#define COUNTS_PER_MOTOR_REV   256.0f
+#define GEAR_RATIO             10.9f
+#define WHEEL_RADIUS_M         0.04f
+
+const bool TRACK_IS_DARK_LINE = true;   // true: 黑线白底；false: 白线黑底
+
+const float SENSOR_WEIGHTS[6] = {
+    -450.0f, -150.0f, -50.0f, 50.0f, 150.0f, 450.0f
+};
+
+// 归一化后的判线阈值
+const float LINE_VISIBLE_SUM_THRESHOLD = 0.30f;
+const float LINE_VISIBLE_MAX_THRESHOLD = 0.08f;
+
+// 白底参考自适应参数
+const float WHITE_REF_INIT  = 0.18f;
+const float WHITE_REF_MIN   = 0.05f;
+const float WHITE_REF_DECAY = 0.9995f;
+
+// -------------------- 外环：巡线 -> 目标轮速 --------------------
+// 平均速度固定 0.1 m/s
+const float BASE_SPEED_MPS        = 0.16f;
+const float MAX_STEER_SPEED_MPS   = 0.16f;   // 最大左右差速的一半
+const float SEARCH_DELTA_SPEED    = 0.05f;   // 丢线搜索时：0.05 / 0.15
+
+const float LINE_KP = 0.0004f;
+const float LINE_KI = 0.0001f;
+const float LINE_INT_LIMIT = 200.0f;
+
+// 中心死区，避免抖动
+const float CENTER_DEADBAND = 5.0f;
+
+// -------------------- 内环：轮速 PI -> duty --------------------
+const float WHEEL_KP = 1.2f;
+const float WHEEL_KI = 4.0f;
+
+// 前馈：0.1m/s 对应大约 0.20 duty，可按经验调
+const float WHEEL_FF_GAIN = 2.0f;   // duty ~= FF * targetSpeed
+
+const float DUTY_MIN = 0.00f;
+const float DUTY_MAX = 0.70f;
+const float DUTY_STEP_LIMIT = 0.03f;
+const float WHEEL_INT_LIMIT = 0.08f;
+
+// 串口慢速打印
+const int PRINT_DIVIDER = 40;   // 25ms × 4 = 100ms
+
+// ============================================================
+// 工具函数
+// ============================================================
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// ============================================================
+// 电机驱动类
+// ============================================================
+class MotorDriveBoard{
+private:
+    PwmOut speed_left;
+    PwmOut speed_right;
+
+    DigitalOut mode_left;
+    DigitalOut mode_right;
+
+    DigitalOut direction_left;
+    DigitalOut direction_right;
+
+    DigitalOut enable;
+
+    float period_left;
+    float period_right;
+
+public:
+    MotorDriveBoard(PinName sl, PinName sr,
+                    PinName ml, PinName mr,
+                    PinName dl, PinName dr,
+                    PinName e)
+        : speed_left(sl), speed_right(sr),
+          mode_left(ml), mode_right(mr),
+          direction_left(dl), direction_right(dr),
+          enable(e) {
+        period_left = 0.0f;
+        period_right = 0.0f;
+    }
+
+    void SetDutyCycle(float l, float r){
+        l = clampf(l, 0.0f, 1.0f);
+        r = clampf(r, 0.0f, 1.0f);
+
+        // 你的驱动板是反相 PWM：write(1-duty)
+        speed_left.write(1.0f - l);
+        speed_right.write(1.0f - r);
+    }
+
+    void SetPeriod(float l, float r){
+        speed_left.period(l);
+        speed_right.period(r);
+
+        period_left = l;
+        period_right = r;
+    }
+
+    void SetDirection(int l, int r){
+        direction_left.write(l);
+        direction_right.write(r);
+    }
+
+    void SetMode(int l, int r){
+        mode_left.write(l);
+        mode_right.write(r);
+    }
+
+    void SetEnable(int e){
+        enable.write(e);
+    }
+
+    float GetDutyCycleLeft(){  return speed_left.read();  }
+    float GetDutyCycleRight(){ return speed_right.read(); }
+    float GetPeriodLeft(){     return period_left;        }
+    float GetPeriodRight(){    return period_right;       }
+    int GetModeLeft(){         return mode_left.read();   }
+    int GetModeRight(){        return mode_right.read();  }
+    int GetDirectionLeft(){    return direction_left.read(); }
+    int GetDirectionRight(){   return direction_right.read(); }
+};
+
+// ============================================================
+// 全局对象
+// ============================================================
+Serial pc(USBTX, USBRX, 115200);
+DigitalOut led(LED2);
+
+Ticker controlTicker;
+volatile bool controlFlag = false;
+
+void controlISR() {
+    controlFlag = true;
+}
+
+// ============================================================
+// 传感器类
+// ============================================================
+class SensorArray {
+private:
+    DigitalOut uln1, uln2, uln3, uln4, uln5, uln6;
+    AnalogIn tr1, tr2, tr3, tr4, tr5, tr6;
+
+    void SetLEDsRaw(int u1, int u2, int u3, int u4, int u5, int u6) {
+        uln1.write(u1);
+        uln2.write(u2);
+        uln3.write(u3);
+        uln4.write(u4);
+        uln5.write(u5);
+        uln6.write(u6);
+    }
+
+    void ReadRaw(float out[6]) {
+        out[0] = tr1.read();
+        out[1] = tr2.read();
+        out[2] = tr3.read();
+        out[3] = tr4.read();
+        out[4] = tr5.read();
+        out[5] = tr6.read();
+    }
+
+public:
+    SensorArray(PinName u1, PinName u2, PinName u3,
+                PinName u4, PinName u5, PinName u6,
+                PinName t1, PinName t2, PinName t3,
+                PinName t4, PinName t5, PinName t6)
+        : uln1(u1), uln2(u2), uln3(u3), uln4(u4), uln5(u5), uln6(u6),
+          tr1(t1), tr2(t2), tr3(t3), tr4(t4), tr5(t5), tr6(t6) {
+    }
+
+    void SetAllLEDs(int on) {
+        SetLEDsRaw(on, on, on, on, on, on);
+    }
+
+    // LED开 - LED关
+    void ReadCompensated(float signal[6]) {
+        float ambient[6] = {0};
+        float lit[6]     = {0};
+        float tmp[6];
+
+        SetAllLEDs(0);
+        wait_us(LED_SETTLE_US);
+
+        for (int k = 0; k < ADC_AVG_SAMPLES; ++k) {
+            ReadRaw(tmp);
+            for (int i = 0; i < 6; ++i) ambient[i] += tmp[i];
+        }
+        for (int i = 0; i < 6; ++i) ambient[i] /= (float)ADC_AVG_SAMPLES;
+
+        SetAllLEDs(1);
+        wait_us(LED_SETTLE_US);
+
+        for (int k = 0; k < ADC_AVG_SAMPLES; ++k) {
+            ReadRaw(tmp);
+            for (int i = 0; i < 6; ++i) lit[i] += tmp[i];
+        }
+        for (int i = 0; i < 6; ++i) lit[i] /= (float)ADC_AVG_SAMPLES;
+
+        for (int i = 0; i < 6; ++i) {
+            signal[i] = lit[i] - ambient[i];
+            if (signal[i] < 0.0f) signal[i] = 0.0f;
+        }
+    }
+};
+
+// ============================================================
+// 传感器前端：补偿 + 归一化 + 判线 + 位置估计
+// 返回：线位置偏移量
+//   负值 -> 线在左边
+//   正值 -> 线在右边
+//   0    -> 正中间或丢线
+// ============================================================
+float GetLineOffset(SensorArray &sensorArray, bool &lineVisible, DigitalOut &statusLed) {
+    float rawSig[6]   = {0};
+    float lineNorm[6] = {0};
+
+    static float whiteRef[6] = {
+        WHITE_REF_INIT, WHITE_REF_INIT, WHITE_REF_INIT,
+        WHITE_REF_INIT, WHITE_REF_INIT, WHITE_REF_INIT
+    };
+
+    sensorArray.ReadCompensated(rawSig);
+
+    float sumNorm = 0.0f;
+    float maxNorm = 0.0f;
+    float weightedSum = 0.0f;
+
+    for (int i = 0; i < 6; ++i) {
+        whiteRef[i] *= WHITE_REF_DECAY;
+        if (rawSig[i] > whiteRef[i]) {
+            whiteRef[i] = rawSig[i];
+        }
+        if (whiteRef[i] < WHITE_REF_MIN) {
+            whiteRef[i] = WHITE_REF_MIN;
+        }
+
+        if (TRACK_IS_DARK_LINE) {
+            lineNorm[i] = (whiteRef[i] - rawSig[i]) / whiteRef[i];
+        } else {
+            lineNorm[i] = rawSig[i] / whiteRef[i];
+        }
+
+        lineNorm[i] = clampf(lineNorm[i], 0.0f, 1.0f);
+
+        sumNorm += lineNorm[i];
+        weightedSum += lineNorm[i] * SENSOR_WEIGHTS[i];
+
+        if (lineNorm[i] > maxNorm) maxNorm = lineNorm[i];
+    }
+
+    lineVisible =
+        (sumNorm >= LINE_VISIBLE_SUM_THRESHOLD) &&
+        (maxNorm >= LINE_VISIBLE_MAX_THRESHOLD);
+
+    if (!lineVisible) {
+        statusLed = 1;
+        return 0.0f;
+    }
+
+    statusLed = 0;
+    return weightedSum / sumNorm;
+}
+
+// ============================================================
+// 轮速 PI 状态
+// ============================================================
+struct WheelPIState {
+    float targetL;
+    float targetR;
+
+    float dutyL;
+    float dutyR;
+
+    float integralL;
+    float integralR;
+
+    float dutyMin;
+    float dutyMax;
+    float integralLimit;
+    float maxDutyStep;
+    float ffGain;
+};
+
+// ============================================================
+// 编码器计数 -> 轮速（m/s）
+// 注意：这里默认编码器装在电机轴，需乘齿轮比
+// ============================================================
+float CountsToWheelSpeedMps(int deltaCounts, float dt_s) {
+    const float wheelCountsPerRev = COUNTS_PER_MOTOR_REV * GEAR_RATIO;
+    const float wheelRev = ((float)deltaCounts) / wheelCountsPerRev;
+    const float wheelRps = wheelRev / dt_s;
+    return wheelRps * (2.0f * PI_F * WHEEL_RADIUS_M);
+}
+
+// ============================================================
+// 纯双轮 PI：输入当前速度，更新 duty 并输出
+// ============================================================
+void UpdateWheelPI(float speedL, float speedR,
+                   float dt_s,
+                   float Kp, float Ki,
+                   WheelPIState &state,
+                   MotorDriveBoard &motor)
+{
+    const float errorL = state.targetL - speedL;
+    const float errorR = state.targetR - speedR;
+
+    state.integralL += errorL * dt_s;
+    state.integralR += errorR * dt_s;
+
+    state.integralL = clampf(state.integralL, -state.integralLimit, state.integralLimit);
+    state.integralR = clampf(state.integralR, -state.integralLimit, state.integralLimit);
+
+    float cmdL = state.ffGain * state.targetL + Kp * errorL + Ki * state.integralL;
+    float cmdR = state.ffGain * state.targetR + Kp * errorR + Ki * state.integralR;
+
+    cmdL = clampf(cmdL, state.dutyMin, state.dutyMax);
+    cmdR = clampf(cmdR, state.dutyMin, state.dutyMax);
+
+    float stepL = cmdL - state.dutyL;
+    float stepR = cmdR - state.dutyR;
+
+    stepL = clampf(stepL, -state.maxDutyStep, state.maxDutyStep);
+    stepR = clampf(stepR, -state.maxDutyStep, state.maxDutyStep);
+
+    state.dutyL += stepL;
+    state.dutyR += stepR;
+
+    state.dutyL = clampf(state.dutyL, state.dutyMin, state.dutyMax);
+    state.dutyR = clampf(state.dutyR, state.dutyMin, state.dutyMax);
+
+    motor.SetDutyCycle(state.dutyL, state.dutyR);
+}
+
+// ============================================================
+// 主函数
+// ============================================================
+int main() {
+    pc.baud(115200);
+
+    // -------------------- 电机 --------------------
+    MotorDriveBoard motor(PB_4, PA_10, PA_8, PB_5, PB_10, PB_3, PB_8);
+
+    // -------------------- 编码器 --------------------
+    // 左：PA_0 / PA_1
+    // 右：PC_8 / PC_6
+    QEI encoderL(PA_0, PA_1, NC, (int)COUNTS_PER_MOTOR_REV, QEI::X4_ENCODING);
+    QEI encoderR(PC_8, PC_6, NC, (int)COUNTS_PER_MOTOR_REV, QEI::X4_ENCODING);
+
+    // -------------------- 传感器 --------------------
+    SensorArray sensorArray(
+        PA_5, PA_6, PA_7, PB_6, PC_7, PA_9,   // LED enable
+        PC_2, PC_3, PA_4, PB_0, PC_1, PC_0    // analog input
+    );
+
+    // -------------------- 电机初始化 --------------------
+    motor.SetMode(0, 0);                 // unipolar
+    motor.SetDirection(0, 0);            // forward
+    motor.SetPeriod(0.001f, 0.001f);     // 1 kHz PWM
+    motor.SetEnable(1);
+    motor.SetDutyCycle(0.0f, 0.0f);
+
+    // -------------------- 传感器稳定 --------------------
+    sensorArray.SetAllLEDs(0);
+    wait_us(300000);
+
+    // -------------------- 控制定时器 --------------------
+    controlTicker.attach(&controlISR, CONTROL_PERIOD_S);
+
+    // -------------------- 巡线外环状态 --------------------
+    float lineIntegral = 0.0f;
+    float lastSeenError = 0.0f;
+
+    // -------------------- 轮速内环状态 --------------------
+    WheelPIState piState;
+    piState.targetL = BASE_SPEED_MPS;
+    piState.targetR = BASE_SPEED_MPS;
+
+    piState.dutyL = 0.18f;
+    piState.dutyR = 0.18f;
+
+    piState.integralL = 0.0f;
+    piState.integralR = 0.0f;
+
+    piState.dutyMin = DUTY_MIN;
+    piState.dutyMax = DUTY_MAX;
+    piState.integralLimit = WHEEL_INT_LIMIT;
+    piState.maxDutyStep = DUTY_STEP_LIMIT;
+    piState.ffGain = WHEEL_FF_GAIN;
+
+    // 编码器初值
+    int lastPulseL = encoderL.getPulses();
+    int lastPulseR = encoderR.getPulses();
+
+    int printCount = 0;
+
+    pc.printf("Closed-loop line follower start\r\n");
+
+    while (1) {
+        if (!controlFlag) {
+            wait_us(200);
+            continue;
+        }
+        controlFlag = false;
+
+        // ====================================================
+        // 1) 读线，得到外环误差
+        // ====================================================
+        bool lineVisible = false;
+        float lineOffset = GetLineOffset(sensorArray, lineVisible, led);
+
+        // 保持你原来的符号习惯：
+        // GetLineOffset: 左负右正
+        // error = -offset 后，左边线 -> 正误差
+        float error = -lineOffset;
+
+        if (lineVisible) {
+            float steerSpeed = 0.0f;
+
+            if (fabsf(error) <= CENTER_DEADBAND) {
+                lineIntegral = 0.0f;
+                steerSpeed = 0.0f;
+            } else {
+                lineIntegral += error * CONTROL_PERIOD_S;
+                lineIntegral = clampf(lineIntegral, -LINE_INT_LIMIT, LINE_INT_LIMIT);
+
+                steerSpeed = LINE_KP * error + LINE_KI * lineIntegral;
+                steerSpeed = clampf(steerSpeed, -MAX_STEER_SPEED_MPS, MAX_STEER_SPEED_MPS);
+            }
+
+            // 平均速度固定 0.1 m/s
+            piState.targetL = BASE_SPEED_MPS - steerSpeed;
+            piState.targetR = BASE_SPEED_MPS + steerSpeed;
+
+            lastSeenError = error;
+        } else {
+            // 丢线搜索：仍然闭环控速
+            lineIntegral = 0.0f;
+
+            if (lastSeenError >= 0.0f) {
+                // 上次线在左边 -> 往左找
+                piState.targetL = BASE_SPEED_MPS - SEARCH_DELTA_SPEED; // 0.05
+                piState.targetR = BASE_SPEED_MPS + SEARCH_DELTA_SPEED; // 0.15
+            } else {
+                // 上次线在右边 -> 往右找
+                piState.targetL = BASE_SPEED_MPS + SEARCH_DELTA_SPEED; // 0.15
+                piState.targetR = BASE_SPEED_MPS - SEARCH_DELTA_SPEED; // 0.05
+            }
+        }
+
+        piState.targetL = clampf(piState.targetL, 0.0f, 0.20f);
+        piState.targetR = clampf(piState.targetR, 0.0f, 0.20f);
+
+        // ====================================================
+        // 2) 读编码器，计算当前轮速
+        // ====================================================
+        int pulseL = encoderL.getPulses();
+        int pulseR = encoderR.getPulses();
+
+        int deltaL = pulseL - lastPulseL;
+        int deltaR = pulseR - lastPulseR;
+
+        lastPulseL = pulseL;
+        lastPulseR = pulseR;
+
+        // 你这个车之前 forward 时编码器符号是反的，所以这里取负号修正
+        float speedL = -CountsToWheelSpeedMps(deltaL, CONTROL_PERIOD_S);
+        float speedR = -CountsToWheelSpeedMps(deltaR, CONTROL_PERIOD_S);
+
+        // ====================================================
+        // 3) 内环 PI：闭环控制 duty
+        // ====================================================
+        motor.SetDirection(0, 0);   // 这里只做前进，不做倒车
+        UpdateWheelPI(speedL, speedR,
+                      CONTROL_PERIOD_S,
+                      WHEEL_KP, WHEEL_KI,
+                      piState,
+                      motor);
+
+        // ====================================================
+        // 4) 调试输出
+        // ====================================================
+        printCount++;
+        if (printCount >= PRINT_DIVIDER) {
+            printCount = 0;
+            pc.printf("vis=%d err=%.2f tgtL=%.3f tgtR=%.3f spdL=%.3f spdR=%.3f dutyL=%.3f dutyR=%.3f\r\n",
+                      lineVisible ? 1 : 0,
+                      error,
+                      piState.targetL,
+                      piState.targetR,
+                      speedL,
+                      speedR,
+                      piState.dutyL,
+                      piState.dutyR);
+        }
+    }
+}
