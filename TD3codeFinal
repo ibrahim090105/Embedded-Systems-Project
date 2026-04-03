@@ -1,0 +1,1210 @@
+ 
+#include "mbed.h"
+#include "QEI.h"
+#include <cstdio>
+#include <cmath>
+ 
+#define PI_F 3.14159265359f
+#define CONTROL_PERIOD_S   0.005f
+#define CONTROL_PERIOD_US  5000
+#define LED_SETTLE_US      20
+#define ADC_AVG_SAMPLES    1
+
+#define COUNTS_PER_MOTOR_REV   256.0f
+#define GEAR_RATIO             10.9f
+#define WHEEL_RADIUS_M         0.04f
+
+const bool TRACK_IS_DARK_LINE = true;
+
+const float SENSOR_WEIGHTS[6] = {
+    -450.0f, -150.0f, -50.0f, 50.0f, 150.0f, 450.0f
+};
+
+ 
+// 速度策略
+ 
+const float SPEED_CRUISE   = 0.18f;
+const float SPEED_STRAIGHT = 0.30f;
+const float SPEED_TIGHT    = 0.07f;
+
+const float TARGET_SPEED_MIN_TRACK = 0.00f;
+const float TARGET_SPEED_MAX_TRACK = 0.40f;
+
+ 
+// 直线 boost 逻辑
+ 
+const float BOOST_ENTER_TIME_S = 0.1f;   // 原来更严，现在更快进入
+const float BOOST_ERR_ABS_MAX  = 10.0f;   // 放宽
+const float BOOST_DER_ABS_MAX  = 420.0f;  // 放宽
+const float BOOST_CURVE_MAX    = 0.20f;   // 放宽
+const float BOOST_LRBIAS_MAX   = 0.16f;   // 放宽
+
+ 
+// 动态外环参数
+ 
+const float LINE_KP_STRAIGHT = 0.00010f;
+const float LINE_KP_CORNER   = 0.00100f;
+
+const float LINE_KD_STRAIGHT = 0.00000f;
+const float LINE_KD_CORNER   = 0.00003f;
+
+const float CENTER_DEADBAND = 10.0f;
+
+const float D_FILTER_ALPHA   = 0.12f;
+const float DERIVATIVE_LIMIT = 500.0f;
+
+const float PREVIEW_T = 0.0f;
+
+const float MAX_STEER_STRAIGHT = 0.06f;
+const float MAX_STEER_CORNER   = 0.14f;
+
+// 更早识别“快要打满”，提早降速
+const float STEER_SAT_RATIO          = 0.82f;
+const float STEER_SAT_REDUCE_S       = 0.020f;
+const float STEER_SAT_REDUCED_SPEED  = 0.11f;
+
+// 曲率分数滤波：别太敏感，避免速度一抖一抖
+const float CURVE_SCORE_FILTER_NEW = 0.10f;
+const float CURVE_SCORE_FILTER_OLD = 0.90f;
+
+// 基准速度滤波：保持平顺，避免boost突然弹上去
+const float BASE_SPEED_FILTER_NEW = 0.09f;
+const float BASE_SPEED_FILTER_OLD = 0.91f;
+
+ 
+// 丢线与恢复
+ 
+const float LOST_STOP_TIME_S       = 0.025f;
+const float RECOVERY_GO_DELAY_S    = 0.20f;
+const float PRESTOP_DUMP_DELAY_S   = 0.010f;
+const float FROZEN_CLEAR_VISIBLE_S = 0.15f;
+
+const float RUN_ARM_VISIBLE_S = 0.25f;
+
+ 
+// lineVisible 判定参数
+ 
+const float LINE_CONTRAST_MIN = 0.06f;
+const float LINE_RAW_MAX_MIN  = 0.05f;
+const float LINE_STRENGTH_MIN = 0.12f;
+const float LINE_PAIR_MIN     = 0.08f;
+ 
+// 内环：轮速 PI -> duty
+ 
+const float WHEEL_KP = 1.2f;
+const float WHEEL_KI = 4.0f;
+const float WHEEL_FF_GAIN = 2.0f;
+
+const float DUTY_MIN = 0.00f;
+const float DUTY_MAX = 0.99f;
+const float DUTY_STEP_LIMIT = 0.035f;
+const float WHEEL_INT_LIMIT = 0.10f;
+
+ 
+// 180 度掉头参数
+ 
+const int   TURN_180_TICKS       = 960;
+const float TURN_BASE_DUTY       = 0.24f;
+const float TURN_MIN_DUTY        = 0.18f;
+const int   TURN_SLOW_ZONE_TICKS = 300;
+const float TURN_SYNC_KP         = 0.00010f;
+const bool  TURN_LEFT_FORWARD    = true; 
+// 历史缓存参数
+ 
+// 短时详细缓存：20ms/条
+const int LOG_BUFFER_SIZE    = 120;   // 约 3  秒详细缓存
+const int LOG_SAMPLE_DIVIDER = 4;     // 20ms/条
+const int STOP_DUMP_COUNT    = 120;   // 打印最近约 2.4 秒详细信息
+
+// 长时压缩缓存：100ms/条，约 30 秒
+const int LONG_LOG_SAMPLE_DIVIDER = 20;   // 100ms/条
+const int LONG_LOG_BUFFER_SIZE    = 300;  // 30 秒
+const int LONG_DUMP_COUNT         = 300;  // 默认全部打印
+
+
+enum CarState {
+    STATE_TRACKING = 0,
+    STATE_LOST_SEARCH = 1,
+    STATE_STOPPED_RECOVERY = 2,
+    STATE_TURNAROUND_180 = 3
+};
+
+
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static inline int iabs_i(int x) {
+    return (x >= 0) ? x : -x;
+}
+
+class MotorDriveBoard {
+private:
+    PwmOut speed_left;
+    PwmOut speed_right;
+    DigitalOut mode_left;
+    DigitalOut mode_right;
+    DigitalOut direction_left;
+    DigitalOut direction_right;
+    DigitalOut enable;
+
+public:
+    MotorDriveBoard(PinName sl, PinName sr,
+                    PinName ml, PinName mr,
+                    PinName dl, PinName dr,
+                    PinName e)
+        : speed_left(sl), speed_right(sr),
+          mode_left(ml), mode_right(mr),
+          direction_left(dl), direction_right(dr),
+          enable(e) {}
+
+    void SetDutyCycle(float l, float r) {
+        l = clampf(l, 0.0f, 1.0f);
+        r = clampf(r, 0.0f, 1.0f);
+
+        speed_left.write(1.0f - l);
+        speed_right.write(1.0f - r);
+    }
+
+    void SetPeriod(float l, float r) {
+        speed_left.period(l);
+        speed_right.period(r);
+    }
+
+    void SetDirection(int l, int r) {
+        direction_left.write(l);
+        direction_right.write(r);
+    }
+
+    void SetMode(int l, int r) {
+        mode_left.write(l);
+        mode_right.write(r);
+    }
+
+    void SetEnable(int e) {
+        enable.write(e);
+    }
+};
+
+
+static Serial pc(USBTX, USBRX);
+static Serial hm10(PA_11, PA_12);
+
+static DigitalOut led(LED2);
+static Ticker controlTicker;
+static volatile bool controlFlag = false;
+
+static MotorDriveBoard motor(PB_4, PA_10, PA_8, PB_5, PB_10, PB_3, PB_8);
+static QEI encoderL(PA_0, PA_1, NC, (int)COUNTS_PER_MOTOR_REV, QEI::X4_ENCODING);
+static QEI encoderR(PC_8, PC_6, NC, (int)COUNTS_PER_MOTOR_REV, QEI::X4_ENCODING);
+
+class SensorArray {
+private:
+    DigitalOut uln1, uln2, uln3, uln4, uln5, uln6;
+    AnalogIn tr1, tr2, tr3, tr4, tr5, tr6;
+
+    void SetLEDsRaw(int u1, int u2, int u3, int u4, int u5, int u6) {
+        uln1.write(u1); uln2.write(u2); uln3.write(u3);
+        uln4.write(u4); uln5.write(u5); uln6.write(u6);
+    }
+
+    float ReadAvg(AnalogIn &ch) {
+        float sum = 0.0f;
+        for (int i = 0; i < ADC_AVG_SAMPLES; ++i) {
+            sum += ch.read();
+        }
+        return sum / (float)ADC_AVG_SAMPLES;
+    }
+
+    void ReadRaw(float out[6]) {
+        out[0] = ReadAvg(tr1);
+        out[1] = ReadAvg(tr2);
+        out[2] = ReadAvg(tr3);
+        out[3] = ReadAvg(tr4);
+        out[4] = ReadAvg(tr5);
+        out[5] = ReadAvg(tr6);
+    }
+
+public:
+    SensorArray(PinName u1, PinName u2, PinName u3,
+                PinName u4, PinName u5, PinName u6,
+                PinName t1, PinName t2, PinName t3,
+                PinName t4, PinName t5, PinName t6)
+        : uln1(u1), uln2(u2), uln3(u3),
+          uln4(u4), uln5(u5), uln6(u6),
+          tr1(t1), tr2(t2), tr3(t3),
+          tr4(t4), tr5(t5), tr6(t6) {}
+
+    void SetAllLEDs(int on) {
+        SetLEDsRaw(on, on, on, on, on, on);
+    }
+
+    void ReadCompensated(float signal[6]) {
+        float ambient[6] = {0};
+        float lit[6] = {0};
+
+        SetAllLEDs(0);
+        wait_us(LED_SETTLE_US);
+        ReadRaw(ambient);
+
+        SetAllLEDs(1);
+        wait_us(LED_SETTLE_US);
+        ReadRaw(lit);
+
+        for (int i = 0; i < 6; ++i) {
+            signal[i] = lit[i] - ambient[i];
+            if (signal[i] < 0.0f) signal[i] = 0.0f;
+        }
+    }
+};
+
+static SensorArray sensorArray(
+    PA_5, PA_6, PA_7, PB_6, PC_7, PA_9,
+    PC_2, PC_3, PA_4, PB_0, PC_1, PC_0
+);
+
+void controlISR() {
+    controlFlag = true;
+}
+
+
+struct LineInfo {
+    bool lineVisible;
+    float lineOffset;
+
+    float minSig;
+    float maxSig;
+    float contrast;
+
+    float rawSig[6];
+    float normSig[6];
+
+    float lineStrength;
+    float pairMax;
+
+    float leftSum;
+    float rightSum;
+    float lrBias;
+};
+
+
+LineInfo ReadLineInfo(SensorArray &sensorArrayRef, DigitalOut &statusLed) {
+    LineInfo info;
+    info.lineVisible = false;
+    info.lineOffset = 0.0f;
+    info.minSig = 999.0f;
+    info.maxSig = -999.0f;
+    info.contrast = 0.0f;
+    info.lineStrength = 0.0f;
+    info.pairMax = 0.0f;
+    info.leftSum = 0.0f;
+    info.rightSum = 0.0f;
+    info.lrBias = 0.0f;
+
+    for (int i = 0; i < 6; ++i) {
+        info.rawSig[i] = 0.0f;
+        info.normSig[i] = 0.0f;
+    }
+
+    sensorArrayRef.ReadCompensated(info.rawSig);
+
+    for (int i = 0; i < 6; ++i) {
+        if (info.rawSig[i] < info.minSig) info.minSig = info.rawSig[i];
+        if (info.rawSig[i] > info.maxSig) info.maxSig = info.rawSig[i];
+    }
+
+    info.contrast = info.maxSig - info.minSig;
+
+    float sumW = 0.0f;
+    float sumNorm = 0.0f;
+
+    for (int i = 0; i < 6; ++i) {
+        float val = 0.0f;
+
+        if (TRACK_IS_DARK_LINE) {
+            val = info.maxSig - info.rawSig[i];
+        } else {
+            val = info.rawSig[i] - info.minSig;
+        }
+
+        if (val < info.contrast * 0.20f) {
+            val = 0.0f;
+        }
+
+        info.normSig[i] = val;
+        sumNorm += val;
+        sumW += val * SENSOR_WEIGHTS[i];
+    }
+
+    info.lineStrength = sumNorm;
+
+    for (int i = 0; i < 5; ++i) {
+        float p = info.normSig[i] + info.normSig[i + 1];
+        if (p > info.pairMax) info.pairMax = p;
+    }
+
+    info.leftSum  = info.normSig[0] + info.normSig[1] + info.normSig[2];
+    info.rightSum = info.normSig[3] + info.normSig[4] + info.normSig[5];
+
+    float lrDen = info.leftSum + info.rightSum;
+    if (lrDen > 0.0001f) {
+        info.lrBias = fabsf(info.leftSum - info.rightSum) / lrDen;
+    } else {
+        info.lrBias = 0.0f;
+    }
+
+    if (sumNorm > 0.0001f) {
+        info.lineOffset = sumW / sumNorm;
+    } else {
+        info.lineOffset = 0.0f;
+    }
+
+    if (info.contrast >= LINE_CONTRAST_MIN &&
+        info.maxSig >= LINE_RAW_MAX_MIN &&
+        info.lineStrength >= LINE_STRENGTH_MIN &&
+        info.pairMax >= LINE_PAIR_MIN) {
+        info.lineVisible = true;
+        statusLed = 0;
+    } else {
+        info.lineVisible = false;
+        info.lineOffset = 0.0f;
+        statusLed = 1;
+    }
+
+    return info;
+}
+
+struct WheelPIState {
+    float targetL, targetR;
+    float dutyL, dutyR;
+    float integralL, integralR;
+    float dutyMin, dutyMax;
+    float integralLimit;
+    float maxDutyStep;
+    float ffGain;
+};
+
+float CountsToWheelSpeedMps(int deltaCounts, float dt_s) {
+    return (((float)deltaCounts) / (COUNTS_PER_MOTOR_REV * GEAR_RATIO) / dt_s)
+         * (2.0f * PI_F * WHEEL_RADIUS_M);
+}
+
+void UpdateWheelPI(float speedL, float speedR, float dt_s,
+                   float Kp, float Ki,
+                   WheelPIState &state,
+                   MotorDriveBoard &motorRef) {
+    float errorL = state.targetL - speedL;
+    float errorR = state.targetR - speedR;
+
+    state.integralL = clampf(state.integralL + errorL * dt_s,
+                             -state.integralLimit, state.integralLimit);
+    state.integralR = clampf(state.integralR + errorR * dt_s,
+                             -state.integralLimit, state.integralLimit);
+
+    float cmdL = clampf(state.ffGain * state.targetL + Kp * errorL + Ki * state.integralL,
+                        state.dutyMin, state.dutyMax);
+    float cmdR = clampf(state.ffGain * state.targetR + Kp * errorR + Ki * state.integralR,
+                        state.dutyMin, state.dutyMax);
+
+    state.dutyL = clampf(state.dutyL + clampf(cmdL - state.dutyL,
+                                              -state.maxDutyStep, state.maxDutyStep),
+                         state.dutyMin, state.dutyMax);
+
+    state.dutyR = clampf(state.dutyR + clampf(cmdR - state.dutyR,
+                                              -state.maxDutyStep, state.maxDutyStep),
+                         state.dutyMin, state.dutyMax);
+
+    motorRef.SetDutyCycle(state.dutyL, state.dutyR);
+}
+
+struct DebugSample {
+    unsigned long seq;
+    int state;
+    int vis;
+    int boost;
+
+    float off;
+    float err;
+    float pred;
+    float der;
+    float curve;
+
+    float kp;
+    float kd;
+    float integ;
+    float steer;
+    float base;
+    float maxSteer;
+
+    float tL;
+    float tR;
+    float sL;
+    float sR;
+    float dL;
+    float dR;
+
+    float contrast;
+    float strength;
+    float lrBias;
+
+    float raw[6];
+};
+
+
+struct CompactDebugSample {
+    unsigned long seq;
+
+    unsigned char state;
+    unsigned char vis;
+    unsigned char boost;
+
+    short off_x10;
+    short err_x10;
+    short der_x1;
+    short curve_x1000;
+
+    short base_x1000;
+    short steer_x1000;
+
+    short tL_x1000;
+    short tR_x1000;
+    short sL_x1000;
+    short sR_x1000;
+    short dL_x1000;
+    short dR_x1000;
+
+    unsigned short contrast_x1000;
+    unsigned short strength_x1000;
+    unsigned short lrBias_x1000;
+};
+
+
+static float g_lastLineError = 0.0f;
+static float g_lastDerivative = 0.0f;
+
+static float g_curveScoreFilt = 0.0f;
+static float g_steerSatTimer = 0.0f;
+static float g_baseSpeedFilt = SPEED_TIGHT;
+static float g_boostConfirmTimer = 0.0f;
+static bool  g_straightBoostActive = false;
+
+static float g_dbgKpEff = 0.0f;
+static float g_dbgKdEff = 0.0f;
+static float g_dbgPredError = 0.0f;
+static float g_dbgSteerSpeed = 0.0f;
+static float g_dbgBaseSpeed = SPEED_TIGHT;
+static float g_dbgMaxSteerEff = MAX_STEER_STRAIGHT;
+static float g_dbgCurveScore = 0.0f;
+static int   g_dbgBoost = 0;
+
+static CarState g_carState = STATE_STOPPED_RECOVERY;
+static float g_lostTimer = 0.0f;
+static float g_recoveryTimer = 0.0f;
+static float g_visibleStableTimer = 0.0f;
+static float g_armedVisibleTimer = 0.0f;
+
+static bool g_runArmed = false;
+static bool g_stopDumpDone = false;
+
+static WheelPIState g_piState;
+
+static int g_lastPulseL = 0;
+static int g_lastPulseR = 0;
+
+static int g_turnStartPulseL = 0;
+static int g_turnStartPulseR = 0;
+static bool g_turnCommandPending = false;
+
+static DebugSample liveRing[LOG_BUFFER_SIZE];
+static int liveHead = 0;
+static int liveCount = 0;
+
+static DebugSample frozenBuf[LOG_BUFFER_SIZE];
+static int frozenCount = 0;
+static bool frozenValid = false;
+
+static DebugSample fallbackBuf[LOG_BUFFER_SIZE];
+static int fallbackCount = 0;
+
+static CompactDebugSample longRing[LONG_LOG_BUFFER_SIZE];
+static int longHead = 0;
+static int longCount = 0;
+
+static CompactDebugSample frozenLongBuf[LONG_LOG_BUFFER_SIZE];
+static int frozenLongCount = 0;
+static bool frozenLongValid = false;
+
+static int logSampleDivider = 0;
+static int longLogSampleDivider = 0;
+static unsigned long logSeq = 0;
+
+
+void PushRing(DebugSample ring[], int &head, int &count, const DebugSample &s) {
+    ring[head] = s;
+    head++;
+    if (head >= LOG_BUFFER_SIZE) head = 0;
+
+    if (count < LOG_BUFFER_SIZE) count++;
+}
+
+void CopyRingToLinear(const DebugSample ring[],
+                      int head, int count,
+                      DebugSample outBuf[],
+                      int &outCount) {
+    outCount = count;
+    if (count <= 0) return;
+
+    int start = head - count;
+    while (start < 0) start += LOG_BUFFER_SIZE;
+
+    for (int i = 0; i < count; ++i) {
+        outBuf[i] = ring[(start + i) % LOG_BUFFER_SIZE];
+    }
+}
+
+void DumpLinearBuffer(Serial &pcRef, const DebugSample buf[], int count, int wantCount) {
+    if (count <= 0) return;
+
+    int start = 0;
+    if (count > wantCount) {
+        start = count - wantCount;
+    }
+
+    pcRef.printf("\r\n=== PRE-STOP BUFFER DUMP (%d of %d) ===\r\n", count - start, count);
+
+    for (int i = start; i < count; ++i) {
+        const DebugSample &s = buf[i];
+
+        pcRef.printf(
+            "#%lu S=%d V=%d B=%d off=%.1f e=%.1f pe=%.1f de=%.0f cv=%.2f "
+            "kp=%.5f kd=%.5f I=%.2f st=%.3f b=%.2f ms=%.3f "
+            "t=%.2f/%.2f s=%.2f/%.2f d=%.2f/%.2f "
+            "c=%.3f str=%.3f lr=%.2f r=[%.2f %.2f %.2f %.2f %.2f %.2f]\r\n",
+            s.seq,
+            s.state, s.vis, s.boost,
+            s.off, s.err, s.pred, s.der, s.curve,
+            s.kp, s.kd, s.integ, s.steer, s.base, s.maxSteer,
+            s.tL, s.tR, s.sL, s.sR, s.dL, s.dR,
+            s.contrast, s.strength, s.lrBias,
+            s.raw[0], s.raw[1], s.raw[2], s.raw[3], s.raw[4], s.raw[5]
+        );
+    }
+
+    pcRef.printf("=== END OF PRE-STOP BUFFER ===\r\n");
+}
+
+
+void PushCompactRing(CompactDebugSample ring[], int &head, int &count, const CompactDebugSample &s) {
+    ring[head] = s;
+    head++;
+    if (head >= LONG_LOG_BUFFER_SIZE) head = 0;
+
+    if (count < LONG_LOG_BUFFER_SIZE) count++;
+}
+
+void CopyCompactRingToLinear(const CompactDebugSample ring[],
+                             int head, int count,
+                             CompactDebugSample outBuf[],
+                             int &outCount) {
+    outCount = count;
+    if (count <= 0) return;
+
+    int start = head - count;
+    while (start < 0) start += LONG_LOG_BUFFER_SIZE;
+
+    for (int i = 0; i < count; ++i) {
+        outBuf[i] = ring[(start + i) % LONG_LOG_BUFFER_SIZE];
+    }
+}
+
+void DumpCompactBuffer(Serial &pcRef, const CompactDebugSample buf[], int count, int wantCount) {
+    if (count <= 0) return;
+
+    int start = 0;
+    if (count > wantCount) {
+        start = count - wantCount;
+    }
+
+    pcRef.printf("\r\n=== LONG HISTORY DUMP (%d of %d) ===\r\n", count - start, count);
+
+    for (int i = start; i < count; ++i) {
+        const CompactDebugSample &s = buf[i];
+
+        pcRef.printf(
+            "#%lu S=%d V=%d B=%d "
+            "off=%.1f e=%.1f de=%d cv=%.3f "
+            "b=%.3f st=%.3f "
+            "t=%.3f/%.3f s=%.3f/%.3f d=%.3f/%.3f "
+            "c=%.3f str=%.3f lr=%.3f\r\n",
+            s.seq,
+            (int)s.state,
+            (int)s.vis,
+            (int)s.boost,
+            0.1f   * (float)s.off_x10,
+            0.1f   * (float)s.err_x10,
+            (int)s.der_x1,
+            0.001f * (float)s.curve_x1000,
+            0.001f * (float)s.base_x1000,
+            0.001f * (float)s.steer_x1000,
+            0.001f * (float)s.tL_x1000,
+            0.001f * (float)s.tR_x1000,
+            0.001f * (float)s.sL_x1000,
+            0.001f * (float)s.sR_x1000,
+            0.001f * (float)s.dL_x1000,
+            0.001f * (float)s.dR_x1000,
+            0.001f * (float)s.contrast_x1000,
+            0.001f * (float)s.strength_x1000,
+            0.001f * (float)s.lrBias_x1000
+        );
+    }
+
+    pcRef.printf("=== END OF LONG HISTORY ===\r\n");
+}
+
+
+static void ResetPIStateToZero() {
+    g_piState.targetL = 0.0f;
+    g_piState.targetR = 0.0f;
+    g_piState.dutyL = 0.0f;
+    g_piState.dutyR = 0.0f;
+    g_piState.integralL = 0.0f;
+    g_piState.integralR = 0.0f;
+}
+
+static void ResetDynamicTrackingState(float error) {
+    g_lastLineError = error;
+    g_lastDerivative = 0.0f;
+    g_curveScoreFilt = 0.0f;
+    g_steerSatTimer = 0.0f;
+    g_baseSpeedFilt = SPEED_CRUISE;
+    g_boostConfirmTimer = 0.0f;
+    g_straightBoostActive = false;
+}
+
+static void ForceMotorStop() {
+    motor.SetDirection(0, 0);
+    motor.SetDutyCycle(0.0f, 0.0f);
+}
+
+
+int main() {
+    pc.baud(115200);
+    hm10.baud(9600);
+
+    motor.SetMode(0, 0);
+    motor.SetDirection(0, 0);
+    motor.SetPeriod(0.001f, 0.001f);
+    motor.SetEnable(1);
+    motor.SetDutyCycle(0.0f, 0.0f);
+
+    sensorArray.SetAllLEDs(0);
+    wait_us(300000);
+
+    g_piState.dutyMin = DUTY_MIN;
+    g_piState.dutyMax = DUTY_MAX;
+    g_piState.integralLimit = WHEEL_INT_LIMIT;
+    g_piState.maxDutyStep = DUTY_STEP_LIMIT;
+    g_piState.ffGain = WHEEL_FF_GAIN;
+    ResetPIStateToZero();
+
+    g_lastPulseL = encoderL.getPulses();
+    g_lastPulseR = encoderR.getPulses();
+    g_turnStartPulseL = g_lastPulseL;
+    g_turnStartPulseR = g_lastPulseR;
+
+    controlTicker.attach(&controlISR, CONTROL_PERIOD_S);
+
+    while (1) {
+        while (hm10.readable()) {
+            char bleChar = hm10.getc();
+            if ((bleChar == 'A' || bleChar == 'a') && g_runArmed) {
+                g_turnCommandPending = true;
+            }
+        }
+
+        if (!controlFlag) {
+            wait_us(10);
+            continue;
+        }
+        controlFlag = false;
+
+        LineInfo line = ReadLineInfo(sensorArray, led);
+        float error = -line.lineOffset;
+
+        int pulseL = encoderL.getPulses();
+        int pulseR = encoderR.getPulses();
+
+        int deltaL = pulseL - g_lastPulseL;
+        int deltaR = pulseR - g_lastPulseR;
+
+        g_lastPulseL = pulseL;
+        g_lastPulseR = pulseR;
+
+        float speedL = -CountsToWheelSpeedMps(deltaL, CONTROL_PERIOD_S);
+        float speedR = -CountsToWheelSpeedMps(deltaR, CONTROL_PERIOD_S);
+
+        bool reacquiredThisCycle = false;
+
+        g_dbgKpEff = 0.0f;
+        g_dbgKdEff = 0.0f;
+        g_dbgPredError = error;
+        g_dbgSteerSpeed = 0.0f;
+        g_dbgBaseSpeed = SPEED_TIGHT;
+        g_dbgMaxSteerEff = MAX_STEER_STRAIGHT;
+        g_dbgCurveScore = g_curveScoreFilt;
+        g_dbgBoost = g_straightBoostActive ? 1 : 0;
+
+        if (!g_runArmed) {
+            if (line.lineVisible) {
+                g_armedVisibleTimer += CONTROL_PERIOD_S;
+                if (g_armedVisibleTimer >= RUN_ARM_VISIBLE_S) {
+                    g_runArmed = true;
+                    g_carState = STATE_TRACKING;
+                    g_visibleStableTimer = 0.0f;
+                    g_recoveryTimer = 0.0f;
+                    g_lostTimer = 0.0f;
+                    ResetDynamicTrackingState(error);
+                    g_stopDumpDone = false;
+                    frozenValid = false;
+                    frozenLongValid = false;
+                }
+            } else {
+                g_armedVisibleTimer = 0.0f;
+            }
+
+            ResetPIStateToZero();
+            ForceMotorStop();
+            continue;
+        }
+
+        if (g_turnCommandPending && g_carState != STATE_TURNAROUND_180) {
+            g_turnCommandPending = false;
+
+            g_carState = STATE_TURNAROUND_180;
+            g_turnStartPulseL = pulseL;
+            g_turnStartPulseR = pulseR;
+
+            g_lostTimer = 0.0f;
+            g_recoveryTimer = 0.0f;
+
+            g_lastLineError = 0.0f;
+            g_lastDerivative = 0.0f;
+            g_curveScoreFilt = 0.0f;
+            g_steerSatTimer = 0.0f;
+            g_baseSpeedFilt = SPEED_TIGHT;
+            g_boostConfirmTimer = 0.0f;
+            g_straightBoostActive = false;
+
+            ResetPIStateToZero();
+            motor.SetDutyCycle(0.0f, 0.0f);
+            g_stopDumpDone = false;
+        }
+
+
+        if (g_carState != STATE_TURNAROUND_180) {
+            if (line.lineVisible) {
+                g_visibleStableTimer += CONTROL_PERIOD_S;
+
+                if (g_carState == STATE_STOPPED_RECOVERY) {
+                    g_recoveryTimer += CONTROL_PERIOD_S;
+
+                    if (g_recoveryTimer >= RECOVERY_GO_DELAY_S) {
+                        g_carState = STATE_TRACKING;
+                        ResetDynamicTrackingState(error);
+                        g_piState.integralL = 0.0f;
+                        g_piState.integralR = 0.0f;
+                        g_stopDumpDone = false;
+                    }
+                } else {
+                    if (g_carState == STATE_LOST_SEARCH) {
+                        reacquiredThisCycle = true;
+                    }
+
+                    g_carState = STATE_TRACKING;
+                    g_lostTimer = 0.0f;
+                    g_recoveryTimer = 0.0f;
+                    g_stopDumpDone = false;
+                }
+
+                if (g_visibleStableTimer >= FROZEN_CLEAR_VISIBLE_S) {
+                    frozenValid = false;
+                    frozenLongValid = false;
+                }
+            } else {
+                g_visibleStableTimer = 0.0f;
+
+                if (g_carState == STATE_TRACKING) {
+                    CopyRingToLinear(liveRing, liveHead, liveCount, frozenBuf, frozenCount);
+                    frozenValid = (frozenCount > 0);
+
+                    CopyCompactRingToLinear(longRing, longHead, longCount,
+                                            frozenLongBuf, frozenLongCount);
+                    frozenLongValid = (frozenLongCount > 0);
+
+                    g_carState = STATE_LOST_SEARCH;
+                    g_lostTimer = CONTROL_PERIOD_S;
+                    g_recoveryTimer = 0.0f;
+                }
+                else if (g_carState == STATE_LOST_SEARCH) {
+                    g_lostTimer += CONTROL_PERIOD_S;
+
+                    if (g_lostTimer >= LOST_STOP_TIME_S) {
+                        g_carState = STATE_STOPPED_RECOVERY;
+                        g_recoveryTimer = 0.0f;
+                    }
+                }
+                else if (g_carState == STATE_STOPPED_RECOVERY) {
+                    g_recoveryTimer = 0.0f;
+                }
+            }
+        }
+
+        if (g_carState == STATE_TURNAROUND_180) {
+            int turnedL = iabs_i(pulseL - g_turnStartPulseL);
+            int turnedR = iabs_i(pulseR - g_turnStartPulseR);
+            int turnAvg = (turnedL + turnedR) / 2;
+            int remain  = TURN_180_TICKS - turnAvg;
+
+            if (remain <= 0) {
+                motor.SetDutyCycle(0.0f, 0.0f);
+                motor.SetDirection(0, 0);
+
+                if (line.lineVisible) {
+                    g_carState = STATE_TRACKING;
+                    ResetDynamicTrackingState(error);
+                    g_piState.integralL = 0.0f;
+                    g_piState.integralR = 0.0f;
+                    frozenValid = false;
+                    frozenLongValid = false;
+                } else {
+                    CopyRingToLinear(liveRing, liveHead, liveCount, frozenBuf, frozenCount);
+                    frozenValid = (frozenCount > 0);
+
+                    CopyCompactRingToLinear(longRing, longHead, longCount,
+                                            frozenLongBuf, frozenLongCount);
+                    frozenLongValid = (frozenLongCount > 0);
+
+                    g_carState = STATE_LOST_SEARCH;
+                    g_lostTimer = 0.0f;
+                    g_recoveryTimer = 0.0f;
+                    g_lastDerivative = 0.0f;
+                    g_curveScoreFilt = 0.0f;
+                    g_steerSatTimer = 0.0f;
+                    g_baseSpeedFilt = SPEED_TIGHT;
+                    g_boostConfirmTimer = 0.0f;
+                    g_straightBoostActive = false;
+                }
+            } else {
+                float baseDuty = TURN_BASE_DUTY;
+
+                if (remain < TURN_SLOW_ZONE_TICKS) {
+                    float k = (float)remain / (float)TURN_SLOW_ZONE_TICKS;
+                    k = clampf(k, 0.0f, 1.0f);
+                    baseDuty = TURN_MIN_DUTY + k * (TURN_BASE_DUTY - TURN_MIN_DUTY);
+                }
+
+                float syncErr = (float)(turnedL - turnedR);
+                float corr = clampf(TURN_SYNC_KP * syncErr, -0.05f, 0.05f);
+
+                float dutyL = clampf(baseDuty - corr, 0.0f, DUTY_MAX);
+                float dutyR = clampf(baseDuty + corr, 0.0f, DUTY_MAX);
+
+                if (TURN_LEFT_FORWARD) {
+                    motor.SetDirection(0, 1);
+                } else {
+                    motor.SetDirection(1, 0);
+                }
+
+                motor.SetDutyCycle(dutyL, dutyR);
+
+                g_piState.targetL = 0.0f;
+                g_piState.targetR = 0.0f;
+                g_piState.dutyL = dutyL;
+                g_piState.dutyR = dutyR;
+            }
+        }
+        else if (g_carState == STATE_STOPPED_RECOVERY) {
+            ResetPIStateToZero();
+            ForceMotorStop();
+        }
+        else if (g_carState == STATE_LOST_SEARCH) {
+            g_lastDerivative = 0.0f;
+            g_curveScoreFilt = 1.0f;
+            g_steerSatTimer = 0.0f;
+            g_boostConfirmTimer = 0.0f;
+            g_straightBoostActive = false;
+            g_baseSpeedFilt = SPEED_TIGHT;
+
+            ResetPIStateToZero();
+            ForceMotorStop();
+        }
+        else {
+
+            if (reacquiredThisCycle) {
+                ResetDynamicTrackingState(error);
+            }
+
+            if (fabsf(error) <= CENTER_DEADBAND) {
+                g_lastDerivative = 0.0f;
+                g_lastLineError = error;
+            } else {
+                float rawDerivative = (error - g_lastLineError) / CONTROL_PERIOD_S;
+                float filteredDerivative =
+                    D_FILTER_ALPHA * rawDerivative +
+                    (1.0f - D_FILTER_ALPHA) * g_lastDerivative;
+
+                filteredDerivative = clampf(filteredDerivative,
+                                            -DERIVATIVE_LIMIT,
+                                             DERIVATIVE_LIMIT);
+
+                g_lastDerivative = filteredDerivative;
+                g_lastLineError = error;
+            }
+
+            float eNorm = clampf(fabsf(error) / 120.0f, 0.0f, 1.0f);
+            float dNorm = clampf(fabsf(g_lastDerivative) / 600.0f, 0.0f, 1.0f);
+            float cNorm = clampf(line.lrBias, 0.0f, 1.0f);
+
+            float curveScoreRaw =
+                0.50f * eNorm +
+                0.15f * dNorm +
+                0.35f * cNorm;
+
+            curveScoreRaw = clampf(curveScoreRaw, 0.0f, 1.0f);
+
+            g_curveScoreFilt =
+                CURVE_SCORE_FILTER_NEW * curveScoreRaw +
+                CURVE_SCORE_FILTER_OLD * g_curveScoreFilt;
+
+            g_curveScoreFilt = clampf(g_curveScoreFilt, 0.0f, 1.0f);
+            g_dbgCurveScore = g_curveScoreFilt;
+
+            bool straightCandidate =
+                line.lineVisible &&
+                (fabsf(error) < BOOST_ERR_ABS_MAX) &&
+                (fabsf(g_lastDerivative) < BOOST_DER_ABS_MAX) &&
+                (line.lrBias < BOOST_LRBIAS_MAX) &&
+                (g_curveScoreFilt < BOOST_CURVE_MAX);
+
+            if (straightCandidate) {
+                g_boostConfirmTimer += CONTROL_PERIOD_S;
+                if (g_boostConfirmTimer >= BOOST_ENTER_TIME_S) {
+                    g_straightBoostActive = true;
+                }
+            } else {
+                g_boostConfirmTimer = 0.0f;
+                g_straightBoostActive = false;
+            }
+
+            float desiredBase = SPEED_CRUISE -
+                (SPEED_CRUISE - SPEED_TIGHT) * sqrtf(g_curveScoreFilt);
+
+            if (desiredBase < SPEED_TIGHT) desiredBase = SPEED_TIGHT;
+            if (desiredBase > SPEED_CRUISE) desiredBase = SPEED_CRUISE;
+
+            if (g_straightBoostActive) {
+                desiredBase = SPEED_STRAIGHT;
+            }
+
+            float roughMaxSteer =
+                MAX_STEER_STRAIGHT +
+                g_curveScoreFilt * (MAX_STEER_CORNER - MAX_STEER_STRAIGHT);
+
+            float roughKp =
+                LINE_KP_STRAIGHT +
+                g_curveScoreFilt * (LINE_KP_CORNER - LINE_KP_STRAIGHT);
+
+            float roughKd =
+                LINE_KD_STRAIGHT +
+                g_curveScoreFilt * (LINE_KD_CORNER - LINE_KD_STRAIGHT);
+
+            float roughPred = error + PREVIEW_T * g_lastDerivative;
+            roughPred = clampf(roughPred, -500.0f, 500.0f);
+
+            float roughSteer = 0.0f;
+            if (fabsf(error) > CENTER_DEADBAND) {
+                roughSteer = roughKp * roughPred + roughKd * g_lastDerivative;
+                roughSteer = clampf(roughSteer, -roughMaxSteer, roughMaxSteer);
+            }
+
+            if (fabsf(roughSteer) > (STEER_SAT_RATIO * roughMaxSteer)) {
+                g_steerSatTimer += CONTROL_PERIOD_S;
+            } else {
+                g_steerSatTimer = 0.0f;
+            }
+
+            if (g_steerSatTimer >= STEER_SAT_REDUCE_S) {
+                if (desiredBase > STEER_SAT_REDUCED_SPEED) {
+                    desiredBase = STEER_SAT_REDUCED_SPEED;
+                }
+                g_straightBoostActive = false;
+                g_boostConfirmTimer = 0.0f;
+            }
+
+            g_baseSpeedFilt =
+                BASE_SPEED_FILTER_NEW * desiredBase +
+                BASE_SPEED_FILTER_OLD * g_baseSpeedFilt;
+
+            g_baseSpeedFilt = clampf(g_baseSpeedFilt, SPEED_TIGHT, SPEED_STRAIGHT);
+
+            float KpEff =
+                LINE_KP_STRAIGHT +
+                g_curveScoreFilt * (LINE_KP_CORNER - LINE_KP_STRAIGHT);
+
+            float KdEff =
+                LINE_KD_STRAIGHT +
+                g_curveScoreFilt * (LINE_KD_CORNER - LINE_KD_STRAIGHT);
+
+            float maxSteerEff =
+                MAX_STEER_STRAIGHT +
+                g_curveScoreFilt * (MAX_STEER_CORNER - MAX_STEER_STRAIGHT);
+
+            g_dbgKpEff = KpEff;
+            g_dbgKdEff = KdEff;
+            g_dbgMaxSteerEff = maxSteerEff;
+
+            float predError = error + PREVIEW_T * g_lastDerivative;
+            predError = clampf(predError, -500.0f, 500.0f);
+            g_dbgPredError = predError;
+
+            float steerSpeed = 0.0f;
+            if (fabsf(error) <= CENTER_DEADBAND) {
+                steerSpeed = 0.0f;
+            } else {
+                steerSpeed = KpEff * predError + KdEff * g_lastDerivative;
+                steerSpeed = clampf(steerSpeed, -maxSteerEff, maxSteerEff);
+            }
+
+            g_dbgBaseSpeed = g_baseSpeedFilt;
+            g_dbgSteerSpeed = steerSpeed;
+            g_dbgBoost = g_straightBoostActive ? 1 : 0;
+
+            g_piState.targetL = g_baseSpeedFilt - steerSpeed;
+            g_piState.targetR = g_baseSpeedFilt + steerSpeed;
+
+            g_piState.targetL = clampf(g_piState.targetL,
+                                       TARGET_SPEED_MIN_TRACK,
+                                       TARGET_SPEED_MAX_TRACK);
+            g_piState.targetR = clampf(g_piState.targetR,
+                                       TARGET_SPEED_MIN_TRACK,
+                                       TARGET_SPEED_MAX_TRACK);
+
+            motor.SetDirection(0, 0);
+            UpdateWheelPI(speedL, speedR, CONTROL_PERIOD_S,
+                          WHEEL_KP, WHEEL_KI,
+                          g_piState, motor);
+        }
+
+
+        logSampleDivider++;
+        if (logSampleDivider >= LOG_SAMPLE_DIVIDER) {
+            logSampleDivider = 0;
+
+            static DebugSample s;
+            s.seq   = logSeq++;
+            s.state = (int)g_carState;
+            s.vis   = line.lineVisible ? 1 : 0;
+            s.boost = g_dbgBoost;
+
+            s.off   = line.lineOffset;
+            s.err   = error;
+            s.pred  = g_dbgPredError;
+            s.der   = g_lastDerivative;
+            s.curve = g_dbgCurveScore;
+
+            s.kp    = g_dbgKpEff;
+            s.kd    = g_dbgKdEff;
+            s.integ = 0.0f;
+            s.steer = g_dbgSteerSpeed;
+            s.base  = g_dbgBaseSpeed;
+            s.maxSteer = g_dbgMaxSteerEff;
+
+            s.tL    = g_piState.targetL;
+            s.tR    = g_piState.targetR;
+            s.sL    = speedL;
+            s.sR    = speedR;
+            s.dL    = g_piState.dutyL;
+            s.dR    = g_piState.dutyR;
+
+            s.contrast = line.contrast;
+            s.strength = line.lineStrength;
+            s.lrBias   = line.lrBias;
+
+            for (int i = 0; i < 6; ++i) {
+                s.raw[i] = line.rawSig[i];
+            }
+
+            PushRing(liveRing, liveHead, liveCount, s);
+        }
+
+        longLogSampleDivider++;
+        if (longLogSampleDivider >= LONG_LOG_SAMPLE_DIVIDER) {
+            longLogSampleDivider = 0;
+
+            static CompactDebugSample s2;
+            s2.seq   = logSeq;
+            s2.state = (unsigned char)g_carState;
+            s2.vis   = line.lineVisible ? 1 : 0;
+            s2.boost = (unsigned char)g_dbgBoost;
+
+            s2.off_x10      = (short)clampf(line.lineOffset * 10.0f,   -32768.0f, 32767.0f);
+            s2.err_x10      = (short)clampf(error * 10.0f,             -32768.0f, 32767.0f);
+            s2.der_x1       = (short)clampf(g_lastDerivative,          -32768.0f, 32767.0f);
+            s2.curve_x1000  = (short)clampf(g_dbgCurveScore * 1000.0f,    0.0f, 32767.0f);
+
+            s2.base_x1000   = (short)clampf(g_dbgBaseSpeed * 1000.0f,  -32768.0f, 32767.0f);
+            s2.steer_x1000  = (short)clampf(g_dbgSteerSpeed * 1000.0f, -32768.0f, 32767.0f);
+
+            s2.tL_x1000     = (short)clampf(g_piState.targetL * 1000.0f, -32768.0f, 32767.0f);
+            s2.tR_x1000     = (short)clampf(g_piState.targetR * 1000.0f, -32768.0f, 32767.0f);
+            s2.sL_x1000     = (short)clampf(speedL * 1000.0f,            -32768.0f, 32767.0f);
+            s2.sR_x1000     = (short)clampf(speedR * 1000.0f,            -32768.0f, 32767.0f);
+            s2.dL_x1000     = (short)clampf(g_piState.dutyL * 1000.0f,       0.0f, 32767.0f);
+            s2.dR_x1000     = (short)clampf(g_piState.dutyR * 1000.0f,       0.0f, 32767.0f);
+
+            s2.contrast_x1000 = (unsigned short)clampf(line.contrast * 1000.0f,     0.0f, 65535.0f);
+            s2.strength_x1000 = (unsigned short)clampf(line.lineStrength * 1000.0f, 0.0f, 65535.0f);
+            s2.lrBias_x1000   = (unsigned short)clampf(line.lrBias * 1000.0f,       0.0f, 65535.0f);
+
+            PushCompactRing(longRing, longHead, longCount, s2);
+        }
+
+
+        if (g_carState == STATE_LOST_SEARCH &&
+            !g_stopDumpDone &&
+            g_lostTimer >= PRESTOP_DUMP_DELAY_S) {
+
+            g_stopDumpDone = true;
+
+            if (frozenLongValid && frozenLongCount > 0) {
+                DumpCompactBuffer(pc, frozenLongBuf, frozenLongCount, LONG_DUMP_COUNT);
+            }
+
+            if (frozenValid && frozenCount > 0) {
+                DumpLinearBuffer(pc, frozenBuf, frozenCount, STOP_DUMP_COUNT);
+            }
+        }
+
+        // ====================================================
+        // STOPPED 兜底再打印一次
+        // ====================================================
+        if (g_carState == STATE_STOPPED_RECOVERY &&
+            !g_stopDumpDone) {
+
+            g_stopDumpDone = true;
+
+            if (frozenLongValid && frozenLongCount > 0) {
+                DumpCompactBuffer(pc, frozenLongBuf, frozenLongCount, LONG_DUMP_COUNT);
+            }
+
+            if (frozenValid && frozenCount > 0) {
+                DumpLinearBuffer(pc, frozenBuf, frozenCount, STOP_DUMP_COUNT);
+            } else {
+                CopyRingToLinear(liveRing, liveHead, liveCount, fallbackBuf, fallbackCount);
+                DumpLinearBuffer(pc, fallbackBuf, fallbackCount, STOP_DUMP_COUNT);
+            }
+        }
+    }
+}
